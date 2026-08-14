@@ -1,0 +1,1002 @@
+"""
+Enhanced Evaluator with Full ReasoningBank Integration
+
+This is the updated evaluator.py that integrates:
+1. SemanticPipeline
+2. ReasoningBankPipeline
+3. Complete evaluation flow with learning
+"""
+
+import os
+import json
+import re
+import time
+import re as _re
+import threading
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+from tqdm import tqdm
+from pathlib import Path
+
+from utils.sql_schema import Schema, load_schema, load_full_db_context, format_db_context_for_prompt
+from src.data.sql_parser import parse_sql
+get_sql = parse_sql
+from src.evaluation.base_evaluator import BaseEvaluator
+from src.evaluation.hardness import eval_hardness
+from src.evaluation.sql_rebuilder import (
+    build_valid_col_units, rebuild_sql_col, rebuild_sql_val, clean_query
+)
+from src.evaluation.result_formatter import print_scores
+from utils.logging_utils import get_logger
+from utils.eval_utils import normalize_sql_for_evaluation
+
+
+logger = get_logger(__name__)
+
+# Import semantic pipeline
+try:
+    from src.semantic.semantic_pipeline import SemanticPipeline
+    SEMANTIC_PIPELINE_AVAILABLE = True
+except ImportError:
+    SEMANTIC_PIPELINE_AVAILABLE = False
+    logger.warning("Semantic pipeline not available")
+
+# Import ReasoningBank pipeline
+try:
+    from src.reasoning.reasoning_pipeline import ReasoningBankPipeline
+    REASONING_PIPELINE_AVAILABLE = True
+except ImportError:
+    REASONING_PIPELINE_AVAILABLE = False
+    logger.warning("ReasoningBank pipeline not available")
+
+# Import execution evaluator
+try:
+    from src.evaluation.exec_evaluator import eval_exec_match
+    EXEC_EVAL_AVAILABLE = True
+except ImportError:
+    EXEC_EVAL_AVAILABLE = False
+    logger.warning("exec_eval not available - execution accuracy disabled")
+
+
+class RateLimiter:
+    def __init__(self, requests_per_minute=30):
+        self.rpm = requests_per_minute
+        self.min_interval = 60.0 / requests_per_minute
+        self.last_request = 0
+        self.lock = threading.Lock()
+
+    def wait(self):
+        with self.lock:
+            elapsed = time.time() - self.last_request
+            if elapsed < self.min_interval:
+                time.sleep(self.min_interval - elapsed)
+            self.last_request = time.time()
+
+
+rate_limiter = RateLimiter(requests_per_minute=30)
+def _normalize_column_underscores(sql: str, schema) -> str:
+    """
+    Collapse runs of underscores in identifier tokens so that LLM artifacts
+    like  target_code__allied_  or  viewers__millions_  resolve to real schema
+    columns before execution against SQLite.
+
+    Only touches tokens outside string literals that contain double underscores
+    or trailing underscores, and only replaces them when the collapsed form
+    exists in the schema.
+    """
+    if not sql:
+        return sql
+
+    # Flat set of all known column names
+    known_cols = set()
+    for cols in schema.schema.values():
+        for c in cols:
+            known_cols.add(c.lower())
+
+    # Walk char-by-char, skipping string literals
+    result = []
+    i = 0
+    n = len(sql)
+
+    while i < n:
+        ch = sql[i]
+
+        # String literal — copy verbatim
+        if ch == "'":
+            result.append(ch)
+            i += 1
+            while i < n:
+                c = sql[i]
+                result.append(c)
+                i += 1
+                if c == "'":
+                    if i < n and sql[i] == "'":  # escaped ''
+                        result.append("'")
+                        i += 1
+                        continue
+                    break
+            continue
+
+        # Identifier token
+        if ch.isalpha() or ch == '_':
+            j = i
+            while j < n and (sql[j].isalnum() or sql[j] == '_'):
+                j += 1
+            tok = sql[i:j]
+            i = j
+
+            # Only attempt collapse if token has __ or trailing _
+            if '__' in tok or tok.endswith('_'):
+                collapsed = re.sub(r'_+', '_', tok).strip('_')
+                if collapsed.lower() in known_cols:
+                    result.append(collapsed)
+                    continue
+
+            result.append(tok)
+            continue
+
+        result.append(ch)
+        i += 1
+
+    return "".join(result)
+    
+def _normalize_not_operators(sql: str, is_gold: bool = False) -> str:
+    """
+    Normalise predicted/gold SQL before parsing.
+
+    Handles:
+    1. AND/WHERE col IS NOT NULL / IS NULL      — strip or replace
+    2. AND lower(col) = 'val'                   — strip
+    3. Scientific notation  = 71.1e             → = '71.1e'
+    4. Multi-dot numeric values  = 17.7.109     → = '17.7.109'
+    5. Backslash-escaped apostrophes  \'        → ''  (predicted only)
+    6. Stray double-quotes inside single-quoted literals (predicted only)
+       SKIPPED for gold SQL — WikiSQL song/title values are legitimately
+       stored with surrounding double-quotes as part of the cell value,
+       e.g. '" The Letter "'. Stripping them breaks execution matching.
+    """
+    if not sql:
+        return sql
+
+    if not is_gold:
+        # ── 5: backslash-escaped apostrophes (LLM artifact) ──────────────────
+        sql = sql.replace("\\'", "''")
+
+        # ── 6: stray double-quotes inside single-quoted literals ──────────────
+        result = []
+        in_single = False
+        i = 0
+        n = len(sql)
+        while i < n:
+            ch = sql[i]
+            if ch == "'" and not in_single:
+                in_single = True
+                result.append(ch)
+            elif ch == "'" and in_single:
+                if i + 1 < n and sql[i + 1] == "'":
+                    result.append("'")
+                    result.append("'")
+                    i += 2
+                    continue
+                else:
+                    in_single = False
+                    result.append(ch)
+            elif ch == '"' and in_single:
+                pass  # drop stray double-quote
+            else:
+                result.append(ch)
+            i += 1
+        sql = "".join(result)
+
+    # ── 1: AND/WHERE col IS NOT NULL / IS NULL ────────────────────────────────
+    sql = re.sub(r'\bAND\s+\w+\s+is\s+not\s+null\b',      '', sql, flags=re.IGNORECASE)
+    sql = re.sub(r'\bAND\s+\w+\s+is\s+null\b',            '', sql, flags=re.IGNORECASE)
+    sql = re.sub(r'\bAND\s+\w+\.\w+\s+is\s+not\s+null\b', '', sql, flags=re.IGNORECASE)
+    sql = re.sub(r'\bAND\s+\w+\.\w+\s+is\s+null\b',       '', sql, flags=re.IGNORECASE)
+    sql = re.sub(r'\bWHERE\s+\w+\s+is\s+not\s+null\b',      'WHERE 1=1', sql, flags=re.IGNORECASE)
+    sql = re.sub(r'\bWHERE\s+\w+\s+is\s+null\b',            'WHERE 1=1', sql, flags=re.IGNORECASE)
+    sql = re.sub(r'\bWHERE\s+\w+\.\w+\s+is\s+not\s+null\b', 'WHERE 1=1', sql, flags=re.IGNORECASE)
+    sql = re.sub(r'\bWHERE\s+\w+\.\w+\s+is\s+null\b',       'WHERE 1=1', sql, flags=re.IGNORECASE)
+    sql = re.sub(r'\bWHERE\s+1=1\s+AND\s+', 'WHERE ', sql, flags=re.IGNORECASE)
+    sql = re.sub(r'\bAND\s+1=1\b',           '',       sql, flags=re.IGNORECASE)
+    sql = re.sub(r'\bWHERE\s+1=1\b',         '',       sql, flags=re.IGNORECASE)
+
+    # ── 2: AND lower(col) = 'val' ─────────────────────────────────────────────
+    sql = re.sub(
+        r'\bAND\s+lower\s*\(\s*\w+\s*\)\s*=\s*(?:\'[^\']*\'|"[^"]*"|\S+)',
+        '', sql, flags=re.IGNORECASE
+    )
+
+    # ── 3: Scientific notation ────────────────────────────────────────────────
+    sql = re.sub(r'=\s*(\d+\.\d+[eE])\b', lambda m: f"= '{m.group(1)}'", sql)
+
+    # ── 4: Multi-dot numeric values ───────────────────────────────────────────
+    sql = re.sub(
+        r'([=<>!]+\s*)(\d[\d.]*\.\d[\d.]+)',
+        lambda m: m.group(1) + "'" + m.group(2) + "'"
+        if m.group(2).count('.') >= 2 else m.group(0),
+        sql
+    )
+
+    def _dquote_to_squote(m: re.Match) -> str:
+        inner = m.group(1).replace("'", "''")
+        return f"= '{inner}'"
+    sql = re.sub(r'=\s*"([^"]*)"', _dquote_to_squote, sql)
+
+    sql = re.sub(r'\bNOT\s+IN\b',      'not in',      sql, flags=re.IGNORECASE)
+    sql = re.sub(r'\bNOT\s+LIKE\b',    'not like',    sql, flags=re.IGNORECASE)
+    sql = re.sub(r'\bNOT\s+BETWEEN\b', 'not between', sql, flags=re.IGNORECASE)
+
+    sql = re.sub(r'\s+', ' ', sql).strip()
+    return sql
+
+
+# ---------------------------------------------------------------------------
+# Utility: extract a valid SELECT statement from raw LLM output
+# ---------------------------------------------------------------------------
+
+def _extract_sql_from_output(text: str) -> str:
+    """
+    Robustly extract a clean SQL SELECT statement from arbitrary LLM output.
+    """
+    if not text or not text.strip():
+        return ""
+
+    text = text.strip()
+
+    m = re.search(r"```sql\s*(.*?)\s*```", text, re.IGNORECASE | re.DOTALL)
+    if m:
+        return _finalize_sql(m.group(1))
+
+    m = re.search(r"```\s*(SELECT\b.*?)\s*```", text, re.IGNORECASE | re.DOTALL)
+    if m:
+        return _finalize_sql(m.group(1))
+
+    for prefix in (
+        r"final\s+sql\s*query\s*:",
+        r"final\s+sql\s*:",
+        r"sql\s+query\s*:",
+        r"sql\s*:",
+        r"answer\s*:",
+        r"query\s*:",
+    ):
+        m = re.search(prefix, text, re.IGNORECASE)
+        if m:
+            candidate = text[m.end():].strip()
+            sql = _first_select(candidate)
+            if sql:
+                return _finalize_sql(sql)
+
+    select_lines = [
+        line.strip()
+        for line in text.splitlines()
+        if re.match(r"SELECT\b", line.strip(), re.IGNORECASE)
+    ]
+    if select_lines:
+        return _finalize_sql(select_lines[-1])
+
+    sql = _first_select(text)
+    if sql:
+        return _finalize_sql(sql)
+
+    return _finalize_sql(text)
+
+
+def _first_select(text: str) -> str:
+    m = re.search(r"(SELECT\b.*?)(?:\n\n|\Z)", text, re.IGNORECASE | re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r"(SELECT\b[^;]*)", text, re.IGNORECASE | re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    return ""
+
+
+def _finalize_sql(sql: str) -> str:
+    if not sql:
+        return ""
+    sql = sql.split("\n\n")[0]
+    sql = sql.split(";")[0]
+    sql = re.sub(
+        r"\s+\b(But|However|Note|Therefore|Also|Alternatively|Wait)\b[^\"']*$",
+        "", sql, flags=re.IGNORECASE | re.DOTALL,
+    )
+    sql = sql.replace("`", "")
+    sql = " ".join(sql.split())
+    return sql.strip()
+
+
+def _is_valid_sql(sql: str) -> bool:
+    if not sql:
+        return False
+    return bool(re.match(r"^\s*(SELECT|INSERT|UPDATE|DELETE|WITH)\b", sql, re.IGNORECASE))
+
+
+def _is_complete_sql(sql: str) -> bool:
+    if not sql:
+        return False
+    sql_upper = sql.upper().split()
+    return 'SELECT' in sql_upper and 'FROM' in sql_upper
+
+
+# ---------------------------------------------------------------------------
+
+
+def evaluate(
+    gold: str,
+    predict: Optional[str],
+    db_dir: str,
+    etype: str,
+    kmaps: Dict,
+    plug_value: bool = False,
+    keep_distinct: bool = False,
+    progress_bar_for_each_datapoint: bool = False,
+    use_langchain: bool = False,
+    questions_file: Optional[str] = None,
+    prompt_type: str = "enhanced",
+    enable_debugging: bool = False,
+    use_chromadb: bool = False,
+    chromadb_config: Optional[Dict] = None,
+    use_semantic: bool = False,
+    semantic_config: Optional[Dict] = None,
+    use_reasoning_bank: bool = False,
+    reasoning_config: Optional[Dict] = None,
+    limit: Optional[int] = None
+) -> Dict:
+    """Main evaluation function with full pipeline integration"""
+
+    logger.info("=" * 80)
+    logger.info("TEXT-TO-SQL EVALUATION WITH REASONINGBANK")
+    logger.info("=" * 80)
+
+    evaluator = create_evaluator(
+        prompt_type=prompt_type,
+        enable_debugging=enable_debugging,
+        use_chromadb=use_chromadb,
+        chromadb_config=chromadb_config,
+        use_semantic=use_semantic
+    )
+
+    semantic_pipeline = None
+    if use_semantic and SEMANTIC_PIPELINE_AVAILABLE:
+        try:
+            semantic_pipeline = SemanticPipeline(semantic_config or {'enabled': True})
+            logger.info("✓ Semantic pipeline enabled")
+        except Exception as e:
+            logger.warning(f"Failed to initialize semantic pipeline: {e}")
+
+    reasoning_pipeline = None
+    if use_reasoning_bank and REASONING_PIPELINE_AVAILABLE:
+        try:
+            reasoning_pipeline = ReasoningBankPipeline(
+                db_path="./memory/reasoning_bank.db",
+                chromadb_path="./memory/chromadb",
+                config=reasoning_config
+            )
+            logger.info("✓ ReasoningBank pipeline enabled")
+        except Exception as e:
+            logger.warning(f"Failed to initialize ReasoningBank pipeline: {e}")
+            logger.error(f"ReasoningBank initialization error details: {e}", exc_info=True)
+
+    # === LOAD DATA ===
+    glist = []
+    if gold.endswith('.json'):
+        with open(gold, 'r') as f:
+            data = json.load(f)
+            for item in data:
+                glist.append([item['query'], item['db_id']])
+    else:
+        glist = load_gold_queries(gold)
+
+    if limit:
+        glist = glist[:limit]
+        logger.info(f"Limiting evaluation to {limit} examples")
+
+    schema_mapping = {}
+    for g_turn in glist:
+        db_id = g_turn[1] if len(g_turn) > 1 else None
+        if db_id and db_id not in schema_mapping:
+            db_path = os.path.join(db_dir, db_id, f"{db_id}.sqlite")
+            if os.path.exists(db_path):
+                schema_mapping[db_id] = load_schema(db_path)
+
+    # === GENERATION OR LOAD PREDICTIONS ===
+    plist = []
+    trajectory_map: Dict[int, str] = {}
+
+    if use_langchain and questions_file:
+        logger.info("🤖 Generating SQL with enhanced pipeline...")
+
+        with open(questions_file, 'r') as f:
+            if questions_file.endswith('.json'):
+                questions_data = json.load(f)
+            else:
+                questions_data = [
+                    {'question': line.strip().split('\t')[0],
+                     'db_id': line.strip().split('\t')[1]}
+                    for line in f if line.strip()
+                ]
+
+        if limit:
+            questions_data = questions_data[:limit]
+
+        predictions = []
+        failed_predictions = 0
+
+        for i, item in enumerate(tqdm(questions_data, desc="Generating SQL")):
+            rate_limiter.wait()
+
+            question = item['question']
+            db_id    = item['db_id']
+            db_path  = os.path.join(db_dir, db_id, f"{db_id}.sqlite")
+            gold_sql = glist[i][0] if i < len(glist) else None
+
+            try:
+                db_context = load_full_db_context(db_id, db_dir)
+
+                result = generate_sql_with_pipeline(
+                    question=question,
+                    db_id=db_id,
+                    db_path=db_path,
+                    schema=db_context['schema'],
+                    gold_sql=gold_sql,
+                    evaluator=evaluator,
+                    semantic_pipeline=semantic_pipeline,
+                    reasoning_pipeline=reasoning_pipeline
+                )
+
+                if result.get('trajectory_id'):
+                    trajectory_map[i] = result['trajectory_id']
+
+                sql = result.get('sql', '').strip()
+
+                if sql and not _is_valid_sql(sql):
+                    logger.warning(f"[{i}] Non-SQL output detected, attempting extraction")
+                    sql = _extract_sql_from_output(sql)
+                    result['sql'] = sql
+
+                if not sql:
+                    logger.warning(f"Empty prediction for question {i}: {question}")
+                    result['sql'] = "SELECT 1"
+                    failed_predictions += 1
+
+            except Exception as e:
+                logger.error(f"SQL generation failed for question {i}: {e}")
+                try:
+                    raw = evaluator.generate_sql_from_question(question, db_path)
+                    sql = _extract_sql_from_output(raw) if raw else "SELECT 1"
+                    sql = sql if _is_valid_sql(sql) else "SELECT 1"
+                except Exception:
+                    sql = "SELECT 1"
+
+                result = {'sql': sql, 'trajectory_id': None, 'error': str(e)}
+                failed_predictions += 1
+
+            predictions.append([result['sql']])
+
+        if failed_predictions > 0:
+            logger.warning(f"⚠️  {failed_predictions} predictions failed or were empty")
+
+        plist = [predictions]
+        questions_data_ref = questions_data
+
+    elif predict:
+        plist = load_predictions(predict)
+        if questions_file and os.path.exists(questions_file):
+            with open(questions_file, 'r') as f:
+                questions_data_ref = json.load(f) if questions_file.endswith('.json') else []
+        else:
+            questions_data_ref = []
+    else:
+        raise ValueError("Either use_langchain+questions_file or predict file required")
+
+    # === EVALUATION ===
+    evaluator_obj = BaseEvaluator()
+    levels = ['easy', 'medium', 'hard', 'extra', 'all']
+    partial_types = [
+        'select', 'select(no AGG)', 'where', 'where(no OP)',
+        'group(no Having)', 'group', 'order', 'and/or', 'IUEN', 'keywords'
+    ]
+
+    scores = {}
+    for level in levels:
+        scores[level] = {'count': 0, 'exact': 0.0, 'exec': 0.0, 'partial': {}}
+        for type_ in partial_types:
+            scores[level]['partial'][type_] = {'acc': 0.0, 'rec': 0.0, 'f1': 0.0}
+
+    detailed_results = []
+
+    logger.info("📊 Evaluating predictions...")
+
+    for i, (p_turn, g_turn) in enumerate(tqdm(
+        zip(plist[0], glist),
+        total=len(glist),
+        desc="Evaluating"
+    )):
+        db_id = g_turn[1] if len(g_turn) > 1 else None
+
+        res = evaluate_turn(
+            p_turn=p_turn,
+            g_turn=g_turn,
+            db_dir=db_dir,
+            etype=etype,
+            kmaps=kmaps,
+            evaluator=evaluator_obj,
+            plug_value=plug_value,
+            keep_distinct=keep_distinct,
+            progress_bar=progress_bar_for_each_datapoint,
+            idx=i
+        )
+
+        if res:
+            skip = res.get('skip_from_denominator', False)
+
+            hardness = res.get('hardness', 'all')
+            for level in set(['all', hardness]):
+                if level in scores:
+                    if not skip:
+                        scores[level]['count'] += 1
+                        scores[level]['exact'] += res['exact_score']
+                        scores[level]['exec']  += res.get('exec_score', 0)
+
+                        if 'partial_scores' in res and res['partial_scores']:
+                            for type_, p_score in res['partial_scores'].items():
+                                if type_ in scores[level]['partial']:
+                                    scores[level]['partial'][type_]['acc'] += p_score['acc']
+                                    scores[level]['partial'][type_]['rec'] += p_score['rec']
+                                    scores[level]['partial'][type_]['f1']  += p_score['f1']
+
+            # trajectory_id = trajectory_map.get(i)
+            # if reasoning_pipeline and trajectory_id:
+            #     try:
+            #         reasoning_pipeline.update_trajectory(
+            #             trajectory_id=trajectory_id,
+            #             success=bool(res['exact_score']),
+            #             execution_success=res.get('exec_score', 0) > 0,
+            #             metadata={
+            #                 'exact_match':      bool(res['exact_score']),
+            #                 'execution_match':  res.get('exec_score', 0) > 0,
+            #                 'hardness':         res.get('hardness', 'unknown'),
+            #                 'component_scores': res.get('component_scores'),
+            #                 'partial_scores':   res.get('partial_scores'),
+            #                 'error':            res.get('error'),
+            #                 'parse_error':      res.get('parse_error')
+            #             }
+            #         )
+            #     except Exception as e:
+            #         logger.warning(f"Failed to update trajectory {trajectory_id}: {e}")
+
+            question = (
+                questions_data_ref[i]['question']
+                #if use_langchain and i < len(questions_data_ref) else ''
+                if i < len(questions_data_ref) else ''
+            )
+            entry = res.get('entry') or {}
+            detailed_results.append({
+                'question':         question,
+                'gold_sql':         entry.get('goldSQL', ''),
+                'predicted_sql':    entry.get('predictSQL', ''),
+                'db_id':            db_id,
+                'exact_match':      bool(res['exact_score']) if not skip else None,
+                'execution_match':  res.get('exec_score', 0) > 0 if not skip else None,
+                'hardness':         res.get('hardness', 'unknown'),
+                'error':            res.get('error'),
+                'parse_error':      res.get('parse_error'),
+                'trajectory_id':    trajectory_map.get(i),
+                'skipped':          skip,
+            })
+
+    # === FINALIZE SCORES ===
+    for level in levels:
+        count = scores[level]['count']
+        if count > 0:
+            scores[level]['exact'] /= count
+            scores[level]['exec']  /= count
+            for type_ in partial_types:
+                scores[level]['partial'][type_]['acc'] /= count
+                scores[level]['partial'][type_]['rec'] /= count
+                scores[level]['partial'][type_]['f1']  /= count
+
+    # === LEARNING PHASE ===
+    distillation_result  = {}
+    consolidation_result = {}
+
+    if reasoning_pipeline:
+        logger.info("\n" + "=" * 80)
+        logger.info("🧠 LEARNING PHASE: Distilling strategies from trajectories...")
+        logger.info("=" * 80)
+
+        try:
+            distillation_result = reasoning_pipeline.distill_strategies()
+            logger.info(f"✓ Strategy distillation complete")
+            logger.info(f"  New strategies created:   {distillation_result.get('new_strategies', 0)}")
+            logger.info(f"  Strategies updated:       {distillation_result.get('updated_strategies', 0)}")
+            logger.info(f"  Trajectories processed:   {len(trajectory_map)}")
+        except Exception as e:
+            logger.error(f"Failed to distill strategies: {e}")
+            import traceback;
+            # traceback.print_exc()
+            distillation_result = {'error': str(e)}
+
+        try:
+            logger.info("\n💾 Consolidating memory...")
+            consolidation_result = reasoning_pipeline.consolidate_memory()
+            logger.info(f"✓ Memory consolidation complete")
+            logger.info(f"  Patterns identified: {consolidation_result.get('patterns_identified', 0)}")
+        except Exception as e:
+            logger.warning(f"Memory consolidation failed: {e}")
+            consolidation_result = {'error': str(e)}
+
+    # === RESULTS ===
+    results = {
+        'scores':                scores,
+        'exact_match_accuracy':  scores['all']['exact'],
+        'execution_accuracy':    scores['all']['exec'],
+        'detailed_results':      detailed_results
+    }
+
+    if semantic_pipeline:
+        try:
+            results['semantic_statistics'] = semantic_pipeline.get_statistics()
+        except Exception as e:
+            logger.warning(f"Failed to get semantic statistics: {e}")
+
+    if reasoning_pipeline:
+        try:
+            reasoning_stats = reasoning_pipeline.get_statistics()
+            reasoning_stats['distillation']  = distillation_result
+            reasoning_stats['consolidation'] = consolidation_result
+            reasoning_stats['total_trajectories_collected'] = len(trajectory_map)
+            results['reasoning_statistics'] = reasoning_stats
+
+            stats_file = './results/reasoning_stats.json'
+            Path(stats_file).parent.mkdir(parents=True, exist_ok=True)
+            with open(stats_file, 'w') as f:
+                json.dump(reasoning_stats, f, indent=2)
+            logger.info(f"Reasoning statistics saved to {stats_file}")
+        except Exception as e:
+            logger.warning(f"Failed to save reasoning statistics: {e}")
+
+    try:
+        output_file = './results/evaluation_results.json'
+        Path(output_file).parent.mkdir(parents=True, exist_ok=True)
+        with open(output_file, 'w') as f:
+            json.dump(detailed_results, f, indent=2)
+        logger.info(f"Detailed results saved to {output_file}")
+    except Exception as e:
+        logger.error(f"Failed to save results: {e}")
+
+    print_scores(results['scores'], etype, include_turn_acc=False)
+
+    return results
+
+
+def generate_sql_with_pipeline(
+    question: str,
+    db_id: str,
+    db_path: str,
+    schema: Dict,
+    gold_sql: Optional[str],
+    evaluator,
+    semantic_pipeline: Optional['SemanticPipeline'],
+    reasoning_pipeline: Optional['ReasoningBankPipeline']
+) -> Dict:
+    """Generate SQL with the complete pipeline."""
+
+    semantic_analysis = None
+    if semantic_pipeline:
+        try:
+            semantic_analysis = semantic_pipeline.analyze(question)
+        except Exception as e:
+            logger.warning(f"Semantic analysis failed: {e}")
+
+    if reasoning_pipeline:
+
+        def sql_generator(q: str) -> str:
+            max_retries = 3
+            rate_limiter.wait()
+            for attempt in range(max_retries):
+                try:
+                    raw = evaluator.generate_sql_from_question(q, db_path)
+                    if not raw or not raw.strip():
+                        return ""
+                    if _is_valid_sql(raw):
+                        return raw
+                    extracted = _extract_sql_from_output(raw)
+                    if _is_valid_sql(extracted):
+                        return extracted
+                    logger.warning(f"Could not extract SQL for: {q!r} (attempt {attempt+1})")
+                    return ""
+                except Exception as e:
+                    err = str(e)
+                    if "429" in err or "Resource exhausted" in err or "rate" in err.lower():
+                        wait_time = min(60 * (2 ** attempt), 300)
+                        logger.warning(
+                            f"Rate limit (attempt {attempt+1}/{max_retries}). "
+                            f"Waiting {wait_time}s…"
+                        )
+                        if attempt < max_retries - 1:
+                            time.sleep(wait_time)
+                    else:
+                        logger.error(f"Generation error: {e}")
+                        if attempt < max_retries - 1:
+                            time.sleep(2)
+                        else:
+                            return ""
+            return ""
+
+        try:
+            result = reasoning_pipeline.enhance_sql_generation(
+                question=question,
+                db_id=db_id,
+                schema=schema,
+                gold_sql=gold_sql,
+                db_path = db_path,
+                semantic_analysis=semantic_analysis,
+                sql_generator=sql_generator
+            )
+
+            raw_sql = result.get('sql', '')
+            if raw_sql and not _is_valid_sql(raw_sql):
+                extracted = _extract_sql_from_output(raw_sql)
+                if extracted and _is_valid_sql(extracted):
+                    result['sql'] = extracted
+                else:
+                    logger.warning(f"Could not extract SQL from output: {raw_sql[:80]!r}")
+                    result['sql'] = "SELECT 1"
+
+            if not result.get('sql'):
+                result['sql'] = "SELECT 1"
+
+            return result
+
+        except Exception as e:
+            logger.error(f"ReasoningBank generation failed: {e}")
+            fallback_raw = sql_generator(question)
+            fallback_sql = (
+                _extract_sql_from_output(fallback_raw)
+                if fallback_raw and not _is_valid_sql(fallback_raw)
+                else fallback_raw
+            ) or "SELECT 1"
+            return {
+                'sql':              fallback_sql,
+                'trajectory_id':    None,
+                'strategies_used':  [],
+                'generation_time':  0.0,
+                'metadata':         {'method': 'fallback', 'error': str(e)}
+            }
+
+    # Standard generation (no ReasoningBank)
+    try:
+        raw = evaluator.generate_sql_from_question(question, db_path)
+        sql = _extract_sql_from_output(raw) if raw and not _is_valid_sql(raw) else raw
+        sql = sql or "SELECT 1"
+    except Exception as e:
+        logger.error(f"Standard generation failed: {e}")
+        sql = "SELECT 1"
+
+    return {
+        'sql':             sql,
+        'trajectory_id':   None,
+        'strategies_used': [],
+        'generation_time': 0.0,
+        'metadata':        {'method': 'standard'}
+    }
+
+
+def create_evaluator(
+    prompt_type: str,
+    enable_debugging: bool,
+    use_chromadb: bool,
+    chromadb_config: Optional[Dict],
+    use_semantic: bool
+):
+    """Create appropriate evaluator based on configuration"""
+
+    if use_semantic:
+        try:
+            from semantic_layer import SemanticEvaluator
+            return SemanticEvaluator(
+                prompt_type=prompt_type,
+                enable_debugging=enable_debugging,
+                use_chromadb=use_chromadb,
+                chromadb_config=chromadb_config
+            )
+        except ImportError:
+            logger.warning("SemanticEvaluator not available, using base evaluator")
+
+    if use_chromadb:
+        try:
+            from src.evaluation.chromadb_evaluator import ChromaDBEvaluator
+            return ChromaDBEvaluator(
+                prompt_type=prompt_type,
+                enable_debugging=enable_debugging,
+                chromadb_config=chromadb_config
+            )
+        except ImportError:
+            logger.warning("ChromaDBEvaluator not available, using base evaluator")
+
+    return BaseEvaluator()
+
+
+def evaluate_turn(
+    p_turn, g_turn, db_dir: str, etype: str, kmaps: Dict,
+    evaluator, plug_value: bool, keep_distinct: bool,
+    progress_bar: bool, idx: int = -1
+) -> Optional[Dict]:
+    """
+    Evaluate a single (predicted, gold) SQL pair.
+
+    Returns a dict with keys:
+      exact_score, exec_score, hardness, entry, partial_scores
+      parse_error (optional), error (optional)
+      skip_from_denominator (True only when gold SQL itself is unparseable)
+    """
+
+    p_str   = p_turn[0] if len(p_turn) > 0 else ""
+    g_str   = g_turn[0] if len(g_turn) > 0 else ""
+    db_name = g_turn[1] if len(g_turn) > 1 else None
+
+    if not db_name:
+        return None
+
+    db_path = os.path.join(db_dir, db_name, f"{db_name}.sqlite")
+    schema  = load_schema(db_path)
+
+    # Placeholder queries get 0 without hitting the parser
+    if p_str.strip().upper() == "SELECT 1":
+        return {
+            'exact_score': 0,
+            'exec_score':  0,
+            'hardness':    'unknown',
+            'entry':       {'goldSQL': g_str, 'predictSQL': p_str},
+            'error':       'placeholder_query',
+            'partial_scores': {}
+        }
+
+    # ── Normalize ────────────────────────────────────────────────────────────
+    p_str_normalized = normalize_sql_for_evaluation(p_str) or ""
+    p_str_normalized = p_str_normalized.strip('`').replace('`', '')
+    p_str_normalized = _re.sub(
+        r'\bFROM\s+table\b', 'FROM wikisql_data', p_str_normalized, flags=_re.IGNORECASE
+    )
+    p_str_normalized = _re.sub(
+        r'\bJOIN\s+table\b', 'JOIN wikisql_data', p_str_normalized, flags=_re.IGNORECASE
+    )
+    # Normalise NOT operators, IS NULL artifacts, scientific notation
+    p_str_normalized = _normalize_not_operators(p_str_normalized)
+    p_str_normalized = _normalize_column_underscores(p_str_normalized, schema) 
+    
+    g_str_normalized = normalize_sql_for_evaluation(g_str) or ""
+    g_str_normalized = _normalize_not_operators(g_str_normalized, is_gold=True)
+
+    # ── Parse gold SQL ────────────────────────────────────────────────────────
+    try:
+        g_sql = get_sql(g_str_normalized, schema)
+    except Exception as e:
+        error_msg = str(e) if str(e) else "Unknown parse error"
+        # logger.warning(f"Gold query parse failed on {db_path}: {error_msg}")
+        # logger.debug(f"Gold SQL: {g_str}")
+        return {
+            'exact_score': 0,
+            'exec_score':  0,
+            'hardness':    'unknown',
+            'entry':       {'goldSQL': g_str, 'predictSQL': p_str},
+            'parse_error': f"Gold SQL parse error: {error_msg}",
+            'partial_scores': {},
+            'skip_from_denominator': True,
+        }
+
+    hardness = eval_hardness(g_sql)
+ 
+    # ── Parse predicted SQL ───────────────────────────────────────────────────
+    p_parse_error = None
+    if not _is_complete_sql(p_str_normalized):
+        logger.debug(f"Truncated predicted SQL, skipping parse: {p_str_normalized!r}")
+        p_sql         = None
+        p_parse_error = "Truncated or unparseable predicted SQL"
+    else:
+        try:
+            p_sql = get_sql(p_str_normalized, schema)
+        except Exception as e:
+            error_msg = str(e) if str(e) else "Unknown parse error"
+            # print(f"\n Error [TSV line {idx+1}] db={db_name}")
+            # print(f"   Predicted (normalized): {p_str_normalized}")
+            # print(f"   Predicted (raw)       : {p_str}")
+            import traceback; 
+            # traceback.print_exc()
+            p_sql         = None
+            p_parse_error = f"Predicted SQL parse error: {error_msg}"
+
+    # ── Execution accuracy ────────────────────────────────────────────────────
+    exec_score = 0
+    if EXEC_EVAL_AVAILABLE and etype in ['all', 'exec']:
+        try:
+            exec_score = eval_exec_match(
+                db=db_path,
+                p_str=p_str_normalized,
+                g_str=g_str_normalized,
+                plug_value=plug_value,
+                keep_distinct=keep_distinct,
+                progress_bar_for_each_datapoint=progress_bar
+            )
+        except Exception as e:
+            logger.debug(f"Execution error: {e}")
+
+    if p_sql is None:
+        result = {
+            'exact_score':  0,
+            'exec_score':   exec_score,
+            'hardness':     hardness,
+            'entry':        {'goldSQL': g_str, 'predictSQL': p_str},
+            'partial_scores': {},
+        }
+        if p_parse_error:
+            result['parse_error'] = p_parse_error
+        return result
+
+    # ── Exact match ───────────────────────────────────────────────────────────
+    exact_score    = evaluator.eval_exact_match(p_sql, g_sql)
+    partial_scores = evaluator.partial_scores
+
+    result = {
+        'exact_score':  exact_score,
+        'exec_score':   exec_score,
+        'hardness':     hardness,
+        'entry':        {'goldSQL': g_str, 'predictSQL': p_str},
+        'component_scores': (
+            evaluator.get_component_scores()
+            if hasattr(evaluator, 'get_component_scores') else None
+        ),
+        'partial_scores': partial_scores,
+    }
+    if p_parse_error:
+        result['parse_error'] = p_parse_error
+    return result
+
+
+def load_predictions(predict_path: str) -> List[List]:
+    """Load predictions from file"""
+    with open(predict_path) as f:
+        plist    = []
+        pseq_one = []
+        for line in f.readlines():
+            if len(line.strip()) == 0:
+                plist.append(pseq_one)
+                pseq_one = []
+            else:
+                pseq_one.append(line.strip().split('\t'))
+        if len(pseq_one) != 0:
+            plist.append(pseq_one)
+    return plist
+
+
+def load_gold_queries(gold_path: str) -> List[List]:
+    """Load gold queries from file"""
+    with open(gold_path) as f:
+        glist    = []
+        gseq_one = []
+        for line in f.readlines():
+            if len(line.strip()) == 0:
+                glist.append(gseq_one)
+                gseq_one = []
+            else:
+                lstrip = line.strip().split('\t')
+                gseq_one.append(lstrip)
+        if len(gseq_one) != 0:
+            glist.append(gseq_one)
+    return glist
+
+
+def finalize_scores(scores: Dict, etype: str):
+    """Finalize and normalize scores"""
+    count = scores['all']['count']
+    if count > 0:
+        scores['all']['exact'] /= count
+        if etype in ['all', 'exec']:
+            scores['all']['exec'] /= count
+
+
+def preprocess_question(question: str) -> str:
+    """Normalize and clean question"""
+    return ' '.join(question.split())

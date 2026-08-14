@@ -1,0 +1,25 @@
+# Noise robustness EA experiment configuration
+# Wire this into your config_loader if you'd rather not pass everything as CLI flags.
+
+ea_search:
+  sample_size: 15          # questions used per fitness evaluation (cost driver)
+  population_size: 10
+  generations: 5
+  elite_frac: 0.2
+  tournament_k: 3
+  mutation_sigma: 0.15
+  seed: 42
+  output_dir: output/robustness/ea_search
+
+comparison:
+  output_dir: output/robustness/comparison
+  top_k: 3
+  limit: null               # set to an int to cap the 4-way comparison run size
+  seed: 123
+
+paths:
+  questions: data/spider/dev.json
+  db_dir: data/spider/database
+  semantic_config: configs/semantic_config.yaml
+  reasoning_config: configs/reasoning_config.yaml
+  chromadb_persist_dir: chromadb_store

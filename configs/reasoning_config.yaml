@@ -1,0 +1,349 @@
+# ============================================================================
+# ReasoningBank Configuration
+# Complete configuration for self-evolving memory system
+# ============================================================================
+
+# ============================================================================
+# Core Pipeline Settings
+# ============================================================================
+pipeline:
+  enabled: true
+  
+  # Component enablement
+  enable_retrieval: true
+  enable_distillation: true
+  enable_consolidation: true
+  enable_test_time_scaling: false
+  
+  # Memory paths
+  db_path: "./memory/reasoning_bank.db"
+  chromadb_path: "./memory/chromadb"
+  
+  # Learning parameters
+  consolidation_frequency: 50  # Consolidate every N queries
+  min_trajectories_for_distillation: 10
+  
+  # Test-time scaling
+  use_parallel_scaling_for_hard_queries: true
+  parallel_scaling_candidates: 5
+  sequential_scaling_max_iterations: 3
+
+# ============================================================================
+# Experience Collection
+# ============================================================================
+experience_collection:
+  enabled: true
+  
+  # Trajectory storage
+  max_trajectories_in_memory: 1000
+  persist_trajectories: true
+  
+  # Trajectory metadata
+  collect_reasoning_steps: true
+  collect_intermediate_results: true
+  collect_error_messages: true
+  
+  # Filtering
+  min_generation_time: 0.0  # seconds
+  max_generation_time: 300.0  # seconds
+
+# ============================================================================
+# Self-Judgment
+# ============================================================================
+self_judgment:
+  enabled: true
+  
+  # Success classification
+  success_thresholds:
+    complete_success: 1.0  # exact_match = 1.0
+    partial_success: 0.0   # execution_match but not exact
+  
+  # Insight extraction
+  extract_insights: true
+  min_insight_confidence: 0.6
+  
+  # Pattern recognition
+  pattern_detection:
+    enabled: true
+    min_pattern_frequency: 3
+    
+  # Component analysis
+  component_analysis:
+    enabled: true
+    analyze_select: true
+    analyze_from: true
+    analyze_where: true
+    analyze_groupby: true
+    analyze_orderby: true
+    analyze_having: true
+    analyze_keywords: true
+
+# ============================================================================
+# Strategy Distillation
+# ============================================================================
+strategy_distillation:
+  enabled: true
+  
+  # Distillation parameters
+  min_sample_count: 5
+  min_success_rate: 0.6
+  
+  # Pattern extraction
+  pattern_extraction:
+    method: "frequency_based"  # Options: "frequency_based", "clustering", "llm"
+    min_pattern_frequency: 3
+    max_patterns_per_category: 10
+  
+  # Strategy refinement
+  refinement:
+    enabled: true
+    min_improvement: 0.05  # 5% improvement required
+  
+  # Strategy merging
+  merging:
+    enabled: true
+    similarity_threshold: 0.85
+  
+  # Strategy versioning
+  versioning:
+    enabled: true
+    keep_old_versions: true
+    max_versions_per_strategy: 5
+
+# ============================================================================
+# Memory Storage
+# ============================================================================
+memory_storage:
+  # SQLite configuration
+  sqlite:
+    db_path: "./memory/reasoning_bank.db"
+    connection_pool_size: 5
+    enable_wal: true  # Write-Ahead Logging for better concurrency
+  
+  # ChromaDB configuration
+  chromadb:
+    path: "./memory/chromadb"
+    collection_name: "reasoning_strategies"
+    embedding_model: "all-MiniLM-L6-v2"
+    distance_metric: "cosine"
+  
+  # Backup
+  backup:
+    enabled: true
+    backup_frequency: 100  # Every N strategy updates
+    backup_dir: "./memory/backups"
+    max_backups: 10
+
+# ============================================================================
+# Memory Retrieval
+# ============================================================================
+memory_retrieval:
+  enabled: true
+  
+  # Retrieval strategy
+  strategy: "hybrid"  # Options: "semantic", "keyword", "hybrid"
+  
+  # Number of results
+  default_k: 5
+  max_k: 20
+  
+  # Relevance scoring weights
+  weights:
+    similarity: 0.35
+    intent_match: 0.25
+    performance: 0.25
+    recency: 0.15
+  
+  # Filtering
+  filters:
+    min_similarity: 0.3
+    min_success_rate: 0.5
+    only_active_strategies: true
+  
+  # Diversity
+  diversity:
+    enabled: true
+    diversity_threshold: 0.85  # Don't return very similar strategies
+  
+  # Context enhancement
+  context:
+    use_semantic_analysis: true
+    use_schema_context: true
+    use_difficulty_estimate: true
+    use_database_stats: false
+
+# ============================================================================
+# Memory Consolidation
+# ============================================================================
+memory_consolidation:
+  enabled: true
+  
+  # Consolidation triggers
+  triggers:
+    min_applications: 10
+    performance_drop_threshold: 0.10  # 10% drop
+    refinement_frequency: 20  # applications
+  
+  # Decision thresholds
+  thresholds:
+    keep_threshold: 0.6  # success_rate >= 0.6
+    refine_threshold: 0.5  # 0.5 <= success_rate < 0.6
+    deprecate_threshold: 0.4  # success_rate < 0.4
+    delete_threshold: 0.2  # success_rate < 0.2
+    merge_similarity: 0.90
+    split_variance: 0.15
+  
+  # Evolution tracking
+  evolution:
+    track_evolution: true
+    max_evolution_history: 100
+  
+  # Strategy lifecycle
+  lifecycle:
+    min_sample_count: 5
+    deprecation_grace_period: 50  # applications before deletion
+
+# ============================================================================
+# Test-Time Scaling
+# ============================================================================
+test_time_scaling:
+  enabled: false
+  
+  # Parallel scaling
+  parallel:
+    enabled: true
+    max_workers: 5
+    timeout: 60.0  # seconds
+    
+    # Candidate generation
+    num_candidates: 5
+    temperature_range: [0.3, 0.9]
+    use_diverse_strategies: true
+    
+    # Selection
+    selection_method: "best_score"  # Options: "best_score", "voting", "ensemble"
+  
+  # Sequential scaling
+  sequential:
+    enabled: false
+    max_iterations: 3
+    improvement_threshold: 0.05
+    
+    # Refinement
+    use_feedback: true
+    feedback_type: "error_message"  # Options: "error_message", "execution_result"
+  
+  # Triggers for scaling
+  triggers:
+    use_for_hard_queries: true
+    use_when_no_strategies: true
+    use_when_low_confidence: true
+    confidence_threshold: 0.6
+
+# ============================================================================
+# Integration with Semantic Layer
+# ============================================================================
+semantic_integration:
+  enabled: true
+  
+  # Use semantic analysis in retrieval
+  use_in_retrieval: true
+  
+  # Use semantic complexity for scaling decisions
+  use_complexity_for_scaling: true
+  complexity_threshold: "hard"  # Use scaling for "hard" queries
+  
+  # Map semantic patterns to strategies
+  pattern_mapping:
+    enabled: true
+    
+  # Enhance strategies with semantic info
+  enhance_strategies: true
+
+# ============================================================================
+# Logging and Monitoring
+# ============================================================================
+logging:
+  enabled: true
+  
+  # Log levels
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  
+  # Log files
+  log_file: "./logs/reasoning_bank.log"
+  rotate_logs: true
+  max_log_size: 10485760  # 10 MB
+  backup_count: 5
+  
+  # What to log
+  log_trajectories: true
+  log_judgments: true
+  log_strategies: true
+  log_retrievals: true
+  log_consolidations: true
+  
+  # Performance monitoring
+  performance:
+    enabled: true
+    log_timing: true
+    log_memory_usage: false
+
+# ============================================================================
+# Statistics and Reporting
+# ============================================================================
+statistics:
+  enabled: true
+  
+  # Track statistics
+  track_generation_time: true
+  track_strategy_usage: true
+  track_success_rates: true
+  track_consolidation_events: true
+  
+  # Periodic reporting
+  reporting:
+    enabled: true
+    report_frequency: 100  # Every N queries
+    report_file: "./results/reasoning_stats.json"
+    
+  # Metrics to track
+  metrics:
+    - trajectories_collected
+    - strategies_distilled
+    - strategies_used
+    - memory_consolidations
+    - test_time_scaling_used
+    - average_generation_time
+    - average_exact_match
+    - average_execution_match
+
+# ============================================================================
+# Experimental Features
+# ============================================================================
+experimental:
+  # LLM-based strategy distillation
+  llm_distillation:
+    enabled: false
+    model: "claude-sonnet-4-20250514"
+    max_tokens: 2000
+  
+  # Collaborative learning
+  collaborative_learning:
+    enabled: false
+    share_strategies: false
+    
+  # Online learning
+  online_learning:
+    enabled: true
+    update_frequency: 10  # Update strategies every N applications
+    
+  # Adaptive consolidation
+  adaptive_consolidation:
+    enabled: false
+    adjust_frequency_based_on_performance: false
+  
+  # ── Self-Consistency (used ONLY when gold_sql is not available) ──────────
+  enable_self_consistency_judging: true
+  self_consistency_n_candidates: 4          # extra candidates besides primary
+  self_consistency_agreement_threshold: 0.6 # min agreement to call primary "correct"
+  self_consistency_max_confidence: 0.85     # hard cap, pseudo-label != gold
