@@ -107,6 +107,88 @@ def _stop_on_server_error(exc: Exception, out_f, already_done: int, i: int,
     os.environ['PYTHONWARNINGS'] = 'ignore'
 
     os.execv(sys.executable, [sys.executable] + new_argv)
+
+
+# ── Self-Consistency monitoring ────────────────────────────────────────────
+# Lightweight aggregator that tracks whether temperature-sampled candidates
+# are actually producing diverse agreement_ratio values across the run,
+# rather than every trajectory trivially agreeing 1.0 (which would indicate
+# temperature is silently collapsing back to greedy decoding, e.g. if the
+# sql_generator closure passed to ReasoningBank ever stops forwarding the
+# `temperature` kwarg again in the future).
+class SelfConsistencyMonitor:
+    def __init__(self):
+        self.n_judged = 0
+        self.agreement_ratios = []
+        self.n_perfect_agreement = 0   # ratio == 1.0
+        self.n_partial_agreement = 0   # 0.0 < ratio < 1.0
+        self.n_zero_agreement = 0      # ratio == 0.0
+
+    def record(self, sc_meta):
+        if not sc_meta:
+            return
+        ratio = sc_meta.get('agreement_ratio')
+        if ratio is None:
+            return
+        self.n_judged += 1
+        self.agreement_ratios.append(ratio)
+        if ratio >= 0.999:
+            self.n_perfect_agreement += 1
+        elif ratio <= 0.001:
+            self.n_zero_agreement += 1
+        else:
+            self.n_partial_agreement += 1
+
+    def summary(self) -> dict:
+        if self.n_judged == 0:
+            return {
+                'n_judged': 0,
+                'note': 'Self-consistency never produced a recorded agreement_ratio '
+                        'this run (ReasoningBank may be disabled, or every trajectory '
+                        'hit the non-critical except branch — check --use_reasoning_bank '
+                        'and db_path availability).',
+            }
+        avg_ratio = sum(self.agreement_ratios) / self.n_judged
+        pct_diverse = 100.0 * (self.n_partial_agreement + self.n_zero_agreement) / self.n_judged
+        return {
+            'n_judged': self.n_judged,
+            'avg_agreement_ratio': round(avg_ratio, 4),
+            'n_perfect_agreement_1.0': self.n_perfect_agreement,
+            'n_partial_agreement': self.n_partial_agreement,
+            'n_zero_agreement_0.0': self.n_zero_agreement,
+            'pct_trajectories_showing_diversity': round(pct_diverse, 2),
+        }
+
+    def print_summary(self):
+        s = self.summary()
+        print("\n" + "=" * 70)
+        print("SELF-CONSISTENCY / TEMPERATURE MONITOR")
+        print("=" * 70)
+        if s['n_judged'] == 0:
+            print(f"  ⚠ {s['note']}")
+        else:
+            print(f"  Trajectories judged by self-consistency : {s['n_judged']}")
+            print(f"  Average agreement_ratio                 : {s['avg_agreement_ratio']}")
+            print(f"  Perfect agreement (ratio=1.0)            : {s['n_perfect_agreement_1.0']}")
+            print(f"  Partial agreement (0<ratio<1)            : {s['n_partial_agreement']}")
+            print(f"  Zero agreement (ratio=0.0)                : {s['n_zero_agreement_0.0']}")
+            print(f"  % trajectories showing real diversity    : {s['pct_trajectories_showing_diversity']}%")
+            if s['pct_trajectories_showing_diversity'] == 0.0:
+                print("\n  ⚠ WARNING: 100% of trajectories show perfect agreement (ratio=1.0).")
+                print("    This can be legitimate for easy/simple queries, but if it persists")
+                print("    across a large, difficulty-varied sample, it may indicate temperature")
+                print("    sampling is not actually reaching the LLM (regression of the fix in")
+                print("    reasoning_pipeline.py / self_consistency.py — verify the sql_generator")
+                print("    closure still forwards the `temperature` kwarg).")
+        print("=" * 70)
+
+    def save(self, output_path: str):
+        stats_path = Path(output_path).with_suffix('.self_consistency_stats.json')
+        with open(stats_path, 'w') as f:
+            json.dump(self.summary(), f, indent=2)
+        logger.info(f"Self-consistency monitor stats saved to {stats_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description='Generate SQL predictions to TSV file')
 
@@ -196,6 +278,35 @@ def main():
                 config=cfg,
             )
             logger.info("✓ ReasoningBank ready")
+
+            # ── Startup banner: confirm self-consistency/temperature config ──
+            sc_enabled = reasoning_pipeline.config.get('enable_self_consistency_judging', True)
+            n_cand = reasoning_pipeline.config.get('self_consistency_n_candidates', 4)
+            agree_thr = reasoning_pipeline.self_consistency.agreement_threshold
+            max_conf = reasoning_pipeline.self_consistency.max_confidence
+            if n_cand <= 1:
+                temp_preview = [0.6]
+            else:
+                lo, hi = 0.3, 0.9
+                step = (hi - lo) / (n_cand - 1)
+                temp_preview = [round(lo + i * step, 2) for i in range(n_cand)]
+
+            print("=" * 70)
+            print("SELF-CONSISTENCY / TEMPERATURE CONFIG (checked at startup)")
+            print("=" * 70)
+            print(f"  enable_self_consistency_judging : {sc_enabled}")
+            print(f"  n_additional_candidates          : {n_cand}")
+            print(f"  temperatures to be used           : [0.0 (primary)] + {temp_preview}")
+            print(f"  agreement_threshold                : {agree_thr}")
+            print(f"  max_confidence cap                  : {max_conf}")
+            if not sc_enabled:
+                print("  ⚠ Self-consistency is DISABLED — every trajectory will use only the")
+                print("    primary greedy candidate; agreement_ratio will never be computed.")
+            elif n_cand <= 1 or all(t == 0.0 for t in temp_preview):
+                print("  ⚠ Effective temperature spread looks degenerate — check config.")
+            else:
+                print("  ✓ Temperature sampling is configured correctly for this run.")
+            print("=" * 70 + "\n")
         except Exception as e:
             logger.warning(f"ReasoningBank failed: {e}")
 
@@ -225,6 +336,9 @@ def main():
 
     # ── Schema loader ─────────────────────────────────────────────────────────
     from utils.sql_schema import load_full_db_context
+
+    # ── Self-consistency monitor (only meaningful when ReasoningBank is on) ──
+    sc_monitor = SelfConsistencyMonitor()
 
     # ── Generate ──────────────────────────────────────────────────────────────
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
@@ -300,13 +414,19 @@ def main():
                                     schema=db_context.get('schema', {}),
                                     gold_sql=item.get('query', item.get('sql')),
                                     db_path=db_path,
-                                    sql_generator=lambda q, strategy_hints=None: sql_generator.generate(
+                                    sql_generator=lambda q, strategy_hints=None, temperature=0.0: sql_generator.generate(
                                         q, db_path,
                                         few_shot_examples=few_shot_examples,
                                         semantic_hints=semantic_hints,
-                                        strategy_hints=strategy_hints),
+                                        strategy_hints=strategy_hints,
+                                        temperature=temperature),
                                 )
                                 sql = rb_result.get('sql', '') or ''
+
+                                # ── Monitor: capture self-consistency agreement_ratio ──
+                                sc_meta = (rb_result.get('metadata') or {}).get('self_consistency')
+                                sc_monitor.record(sc_meta)
+
                             except Exception as e:
                                 # Re-raise 5xx immediately — do NOT fall back
                                 _stop_on_server_error(e, out_f, already_done, i,
@@ -352,6 +472,11 @@ def main():
     logger.info(f"      --table data/raw/wikisql/tables.json \\")
     logger.info(f"      --predict {args.output} \\")
     logger.info(f"      --etype all")
+
+    # ── Print + save self-consistency monitor summary ────────────────────────
+    if args.use_reasoning_bank:
+        sc_monitor.print_summary()
+        sc_monitor.save(args.output)
 
 
 if __name__ == '__main__':
