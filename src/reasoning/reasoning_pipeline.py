@@ -92,6 +92,16 @@ class ReasoningBankPipeline:
         self.config = self._default_config()
         if config:
             self.config.update(config)
+            experimental = config.get('experimental', {}) or {}
+            self.config.update({
+                k: v for k, v in experimental.items()
+                if k in (
+                    'enable_self_consistency_judging',
+                    'self_consistency_n_candidates',
+                    'self_consistency_agreement_threshold',
+                    'self_consistency_max_confidence',
+                )
+            })
 
         logger.info("Initializing ReasoningBank Pipeline...")
 
@@ -105,7 +115,8 @@ class ReasoningBankPipeline:
         self.strategy_distillation = StrategyDistillation()
         self.memory_consolidation = MemoryConsolidation(
             memory_store=self.memory_store,
-            distillation=self.strategy_distillation
+            distillation=self.strategy_distillation,
+            config=(config or {}).get('memory_consolidation', {})
         )
         self.parallel_scaling = None
         self.sequential_scaling = None
@@ -209,7 +220,7 @@ class ReasoningBankPipeline:
                 logger.debug(f"Strategy retrieval failed (non-critical): {e}")
 
         # Step 2: Decide scaling
-        use_scaling = (
+        use_scaling = self.config.get('enable_test_time_scaling', False) and (
             self._should_use_test_time_scaling(
                 semantic_analysis=semantic_analysis,
                 strategies_used=strategies_used

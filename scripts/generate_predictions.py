@@ -5,7 +5,7 @@ Step 2: Run evaluate_wikisql.py / evaluate_spider.py with --predict <file>
 
 Usage (WikiSQL):
   python scripts/generate_predictions.py \
-      --questions data/raw/wikisql/dev_spider_format.json \
+      --questions data/raw/wikisql/dev_wiki_format.json \
       --db        data/raw/wikisql/database \
       --output    results/predictions_wikisql.tsv \
       --use_reasoning_bank --use_chromadb --use_semantic \
@@ -107,6 +107,123 @@ def _stop_on_server_error(exc: Exception, out_f, already_done: int, i: int,
     os.environ['PYTHONWARNINGS'] = 'ignore'
 
     os.execv(sys.executable, [sys.executable] + new_argv)
+
+
+# ── Self-Consistency monitoring ────────────────────────────────────────────
+# Lightweight aggregator that tracks whether temperature-sampled candidates
+# are actually producing diverse agreement_ratio values across the run,
+# rather than every trajectory trivially agreeing 1.0 (which would indicate
+# temperature is silently collapsing back to greedy decoding, e.g. if the
+# sql_generator closure passed to ReasoningBank ever stops forwarding the
+# `temperature` kwarg again in the future).
+class SelfConsistencyMonitor:
+    def __init__(self):
+        self.n_judged = 0
+        self.agreement_ratios = []
+        self.n_perfect_agreement = 0   # ratio == 1.0
+        self.n_partial_agreement = 0   # 0.0 < ratio < 1.0
+        self.n_zero_agreement = 0      # ratio == 0.0
+
+    def record(self, sc_meta):
+        if not sc_meta:
+            return
+        ratio = sc_meta.get('agreement_ratio')
+        if ratio is None:
+            return
+        self.n_judged += 1
+        self.agreement_ratios.append(ratio)
+        if ratio >= 0.999:
+            self.n_perfect_agreement += 1
+        elif ratio <= 0.001:
+            self.n_zero_agreement += 1
+        else:
+            self.n_partial_agreement += 1
+
+    def summary(self) -> dict:
+        if self.n_judged == 0:
+            return {
+                'n_judged': 0,
+                'note': 'Self-consistency never produced a recorded agreement_ratio '
+                        'this run (ReasoningBank may be disabled, or every trajectory '
+                        'hit the non-critical except branch — check --use_reasoning_bank '
+                        'and db_path availability).',
+            }
+        avg_ratio = sum(self.agreement_ratios) / self.n_judged
+        pct_diverse = 100.0 * (self.n_partial_agreement + self.n_zero_agreement) / self.n_judged
+        return {
+            'n_judged': self.n_judged,
+            'avg_agreement_ratio': round(avg_ratio, 4),
+            'n_perfect_agreement_1.0': self.n_perfect_agreement,
+            'n_partial_agreement': self.n_partial_agreement,
+            'n_zero_agreement_0.0': self.n_zero_agreement,
+            'pct_trajectories_showing_diversity': round(pct_diverse, 2),
+        }
+
+    def print_summary(self):
+        s = self.summary()
+        print("\n" + "=" * 70)
+        print("SELF-CONSISTENCY / TEMPERATURE MONITOR")
+        print("=" * 70)
+        if s['n_judged'] == 0:
+            print(f"  ⚠ {s['note']}")
+        else:
+            print(f"  Trajectories judged by self-consistency : {s['n_judged']}")
+            print(f"  Average agreement_ratio                 : {s['avg_agreement_ratio']}")
+            print(f"  Perfect agreement (ratio=1.0)            : {s['n_perfect_agreement_1.0']}")
+            print(f"  Partial agreement (0<ratio<1)            : {s['n_partial_agreement']}")
+            print(f"  Zero agreement (ratio=0.0)                : {s['n_zero_agreement_0.0']}")
+            print(f"  % trajectories showing real diversity    : {s['pct_trajectories_showing_diversity']}%")
+            if s['pct_trajectories_showing_diversity'] == 0.0:
+                print("\n  ⚠ WARNING: 100% of trajectories show perfect agreement (ratio=1.0).")
+                print("    This can be legitimate for easy/simple queries, but if it persists")
+                print("    across a large, difficulty-varied sample, it may indicate temperature")
+                print("    sampling is not actually reaching the LLM (regression of the fix in")
+                print("    reasoning_pipeline.py / self_consistency.py — verify the sql_generator")
+                print("    closure still forwards the `temperature` kwarg).")
+        print("=" * 70)
+
+    def save(self, output_path: str, merge_with_existing: bool = False):
+        """
+        Save summary stats to <output>.self_consistency_stats.json.
+
+        merge_with_existing: when True (used on --resume runs), if a stats
+        file already exists from a PRIOR process for this same output file,
+        merge this run's raw agreement_ratios into it before writing —
+        otherwise each resumed run's SelfConsistencyMonitor (a fresh
+        in-memory object, see main()) would silently overwrite the file
+        with only ITS OWN chunk's n_judged, hiding what earlier chunks
+        already judged. Without this, a chunked/resumed run can show a much
+        smaller n_judged than the true total, easily misread as "ReasoningBank
+        isn't running" when it actually is.
+        """
+        stats_path = Path(output_path).with_suffix('.self_consistency_stats.json')
+        ratios = list(self.agreement_ratios)
+
+        if merge_with_existing and stats_path.exists():
+            try:
+                with open(stats_path, 'r') as f:
+                    prior = json.load(f)
+                prior_ratios = prior.get('_raw_agreement_ratios')
+                if prior_ratios:
+                    ratios = prior_ratios + ratios
+            except Exception as e:
+                logger.debug(f"Could not merge prior self-consistency stats: {e}")
+
+        merged = SelfConsistencyMonitor()
+        merged.agreement_ratios = ratios
+        merged.n_judged = len(ratios)
+        merged.n_perfect_agreement = sum(1 for r in ratios if r >= 0.999)
+        merged.n_zero_agreement = sum(1 for r in ratios if r <= 0.001)
+        merged.n_partial_agreement = merged.n_judged - merged.n_perfect_agreement - merged.n_zero_agreement
+
+        summary = merged.summary()
+        summary['_raw_agreement_ratios'] = ratios  # kept so future resumes can merge again
+        with open(stats_path, 'w') as f:
+            json.dump(summary, f, indent=2)
+        logger.info(f"Self-consistency monitor stats saved to {stats_path} "
+                    f"(n_judged total: {merged.n_judged})")
+
+
 def main():
     parser = argparse.ArgumentParser(description='Generate SQL predictions to TSV file')
 
@@ -139,11 +256,11 @@ def main():
 
     args = parser.parse_args()
 
-    # ── Auto-prepare WikiSQL if spider_format file doesn't exist ─────────────
+    # ── Auto-prepare WikiSQL if wiki_format file doesn't exist ─────────────
     if not Path(args.questions).exists() and 'wikisql' in args.questions.lower():
         logger.info(f"Questions file not found: {args.questions}")
         logger.info("Auto-preparing WikiSQL (building SQLite DBs + converting format)...")
-        gold_file = args.questions.replace('_spider_format.json', '.json')
+        gold_file = args.questions.replace('_wiki_format.json', '.json')
         if not Path(gold_file).exists():
             logger.error(f"Cannot find WikiSQL gold file at: {gold_file}")
             sys.exit(1)
@@ -155,7 +272,36 @@ def main():
         convert_wikisql_gold_to_spider_format(
             gold_file=gold_file, output_file=args.questions, limit=args.limit
         )
-        logger.info(f"✓ Spider-format file created: {args.questions}")
+        logger.info(f"✓ Wiki-format file created: {args.questions}")
+
+    # ── Independently rebuild WikiSQL SQLite DBs if the db_dir is missing
+    # or empty, even when the questions file already exists. Without this
+    # check, deleting only data/raw/wikisql/database/ (e.g. to force a
+    # clean rebuild after a schema-naming change) while dev_wiki_format.json
+    # is still present would silently skip the block above entirely, and
+    # every single question would fall through to the "DB not found"
+    # fallback (SELECT 1) — no LLM calls wasted, but the whole run produces
+    # nothing useful until caught and restarted.
+    if 'wikisql' in args.questions.lower():
+        db_root = Path(args.db)
+        # Check for at least one actual .sqlite DB (not just tables.json,
+        # which prepare_wikisql_databases() always (re)writes even when
+        # individual DB builds fail or the dir was only partially built by
+        # an earlier limited/interrupted run — so its mere presence is not
+        # proof the DBs themselves exist).
+        has_sqlite_db = db_root.exists() and any(db_root.glob("*/*.sqlite"))
+        db_is_missing_or_empty = not has_sqlite_db
+        if db_is_missing_or_empty:
+            logger.warning(
+                f"WikiSQL db_dir {args.db} is missing or empty even though "
+                f"{args.questions} exists — rebuilding SQLite DBs now."
+            )
+            from scripts.evaluate_wikisql import prepare_wikisql_databases
+            gold_file_for_db = args.questions.replace('_wiki_format.json', '.json')
+            if not Path(gold_file_for_db).exists():
+                gold_file_for_db = args.questions  # wiki_format file itself has embedded table data
+            prepare_wikisql_databases(gold_file=gold_file_for_db, db_dir=args.db, limit=args.limit)
+            logger.info(f"✓ Rebuilt WikiSQL SQLite DBs in {args.db}")
 
     # ── Load questions ────────────────────────────────────────────────────────
     with open(args.questions, 'r') as f:
@@ -196,6 +342,44 @@ def main():
                 config=cfg,
             )
             logger.info("✓ ReasoningBank ready")
+
+            # ── Startup banner: confirm self-consistency/temperature config ──
+            sc_enabled = reasoning_pipeline.config.get('enable_self_consistency_judging', True)
+            n_cand = reasoning_pipeline.config.get('self_consistency_n_candidates', 4)
+            agree_thr = reasoning_pipeline.self_consistency.agreement_threshold
+            max_conf = reasoning_pipeline.self_consistency.max_confidence
+            if n_cand <= 1:
+                temp_preview = [0.6]
+            else:
+                lo, hi = 0.3, 0.9
+                step = (hi - lo) / (n_cand - 1)
+                temp_preview = [round(lo + i * step, 2) for i in range(n_cand)]
+
+            print("=" * 70)
+            print("SELF-CONSISTENCY / TEMPERATURE CONFIG (checked at startup)")
+            print("=" * 70)
+            print(f"  enable_self_consistency_judging : {sc_enabled}")
+            print(f"  n_additional_candidates          : {n_cand}")
+            print(f"  temperatures to be used           : [0.0 (primary)] + {temp_preview}")
+            print(f"  agreement_threshold                : {agree_thr}")
+            print(f"  max_confidence cap                  : {max_conf}")
+            if not sc_enabled:
+                print("  ⚠ Self-consistency is DISABLED — every trajectory will use only the")
+                print("    primary greedy candidate; agreement_ratio will never be computed.")
+            elif n_cand <= 1 or all(t == 0.0 for t in temp_preview):
+                print("  ⚠ Effective temperature spread looks degenerate — check config.")
+            else:
+                print("  ✓ Temperature sampling is configured correctly for this run.")
+            if args.resume:
+                print("  ℹ --resume active: this process starts with an EMPTY in-memory")
+                print("    trajectory pool (ExperienceCollector is not persisted across")
+                print("    process restarts). A final consolidate_memory() call runs at")
+                print("    the end of THIS run so trajectories collected here still get a")
+                print("    chance to distill into strategies before the process exits —")
+                print("    but strategies already distilled in prior resumed chunks are")
+                print("    unaffected either way, since retrieval/application always reads")
+                print("    the persisted memory_store, not the in-memory collector.")
+            print("=" * 70 + "\n")
         except Exception as e:
             logger.warning(f"ReasoningBank failed: {e}")
 
@@ -225,6 +409,9 @@ def main():
 
     # ── Schema loader ─────────────────────────────────────────────────────────
     from utils.sql_schema import load_full_db_context
+
+    # ── Self-consistency monitor (only meaningful when ReasoningBank is on) ──
+    sc_monitor = SelfConsistencyMonitor()
 
     # ── Generate ──────────────────────────────────────────────────────────────
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
@@ -308,6 +495,11 @@ def main():
                                         temperature=temperature),
                                 )
                                 sql = rb_result.get('sql', '') or ''
+
+                                # ── Monitor: capture self-consistency agreement_ratio ──
+                                sc_meta = (rb_result.get('metadata') or {}).get('self_consistency')
+                                sc_monitor.record(sc_meta)
+
                             except Exception as e:
                                 # Re-raise 5xx immediately — do NOT fall back
                                 _stop_on_server_error(e, out_f, already_done, i,
@@ -349,10 +541,36 @@ def main():
     logger.info(f"  Total: {total} | New this run: {new_count} | Failed/fallback: {failed}")
     logger.info(f"\nNext — evaluate without any LLM calls:")
     logger.info(f"  python scripts/evaluate_wikisql.py \\")
-    logger.info(f"      --gold  data/raw/wikisql/dev_spider_format.json \\")
+    logger.info(f"      --gold  data/raw/wikisql/dev_wiki_format.json \\")
     logger.info(f"      --table data/raw/wikisql/tables.json \\")
     logger.info(f"      --predict {args.output} \\")
     logger.info(f"      --etype all")
+
+    # ── Final consolidation: give THIS process's in-memory trajectory pool
+    # one last chance to distill into strategies before exiting. Without
+    # this, any run that ends (checkpoint hit, --limit reached, or normal
+    # completion) without having landed exactly on a
+    # consolidation_frequency-multiple of trajectories_collected would
+    # silently discard those trajectories — ExperienceCollector holds them
+    # only in RAM, not on disk. Safe to call unconditionally: internally it
+    # already no-ops when there are too few trajectories to distill from.
+    if reasoning_pipeline:
+        try:
+            logger.info("Running final memory consolidation for this run...")
+            consolidation_result = reasoning_pipeline.consolidate_memory()
+            logger.info(
+                f"✓ Final consolidation: {consolidation_result.get('new_strategies', 0)} "
+                f"new strategies distilled from "
+                f"{consolidation_result.get('total_trajectories', 0)} trajectories "
+                f"collected in this run."
+            )
+        except Exception as e:
+            logger.warning(f"Final consolidation failed (non-critical): {e}")
+
+    # ── Print + save self-consistency monitor summary ────────────────────────
+    if args.use_reasoning_bank:
+        sc_monitor.print_summary()
+        sc_monitor.save(args.output, merge_with_existing=args.resume)
 
 
 if __name__ == '__main__':

@@ -47,34 +47,76 @@ class MemoryConsolidation:
     def __init__(
         self,
         memory_store: ReasoningMemoryStore,
-        distillation: StrategyDistillation
+        distillation: StrategyDistillation,
+        config: Optional[Dict] = None
     ):
         """
         Initialize memory consolidation
-        
+
         Args:
             memory_store: ReasoningMemoryStore instance
             distillation: StrategyDistillation instance
+            config: optional overrides, typically read from
+                reasoning_config.yaml's `memory_consolidation` block
+                (both `triggers`/`lifecycle` top-level keys and the
+                nested `thresholds` dict are accepted — see _build_config()).
         """
         self.memory_store = memory_store
         self.distillation = distillation
-        
-        # Consolidation configuration
-        self.config = {
-            'min_applications': 10,           # Min applications to consider consolidation
+        self.config = self._build_config(config)
+
+        # Track consolidation history — required by _refine_strategy(),
+        # _deprecate_strategy(), _merge_strategies(), get_consolidation_summary(),
+        # and export_consolidation_history(), all of which call
+        # self.consolidation_history.append(...)/read it. Without this line,
+        # the FIRST Refine/Deprecate/Merge decision raises AttributeError,
+        # which (same as the config KeyError bug) gets silently swallowed by
+        # ReasoningBankPipeline.consolidate_memory()'s broad except block.
+        self.consolidation_history = []
+
+        logger.info("MemoryConsolidation initialized")
+
+    def _build_config(self, config: Optional[Dict]) -> Dict:
+        defaults = {
+            'min_applications': 10,              # Min NEW applications this cycle to reconsider a strategy
             'performance_drop_threshold': 0.10,  # 10% drop triggers investigation
             'merge_similarity_threshold': 0.90,  # Similarity for merging
             'split_variance_threshold': 0.15,    # Performance variance for splitting
-            'deprecation_threshold': 0.40,       # Success rate below this = deprecate
-            'min_sample_count': 5,               # Min samples to keep strategy
+            'delete_threshold': 0.20,            # success_rate < this (+ enough samples) -> DELETE
+            'deprecate_threshold': 0.40,         # success_rate < this -> DEPRECATE
+            'keep_threshold': 0.60,              # success_rate >= this -> KEEP, else REFINE
+            'min_sample_count': 5,               # Min accumulated samples to allow DELETE
             'refinement_frequency': 20           # Refine every N applications
         }
-        
-        # Track consolidation history
-        self.consolidation_history = []
-        
-        logger.info("MemoryConsolidation initialized")
-    
+        if not config:
+            return defaults
+
+        merged = dict(defaults)
+        triggers = config.get('triggers', {}) or {}
+        thresholds = config.get('thresholds', {}) or {}
+        lifecycle = config.get('lifecycle', {}) or {}
+
+        merged.update({k: v for k, v in config.items() if k in defaults}) 
+        if 'min_applications' in triggers:
+            merged['min_applications'] = triggers['min_applications']
+        if 'performance_drop_threshold' in triggers:
+            merged['performance_drop_threshold'] = triggers['performance_drop_threshold']
+        if 'refinement_frequency' in triggers:
+            merged['refinement_frequency'] = triggers['refinement_frequency']
+        if 'keep_threshold' in thresholds:
+            merged['keep_threshold'] = thresholds['keep_threshold']
+        if 'deprecate_threshold' in thresholds:
+            merged['deprecate_threshold'] = thresholds['deprecate_threshold']
+        if 'delete_threshold' in thresholds:
+            merged['delete_threshold'] = thresholds['delete_threshold']
+        if 'merge_similarity' in thresholds:
+            merged['merge_similarity_threshold'] = thresholds['merge_similarity']
+        if 'split_variance' in thresholds:
+            merged['split_variance_threshold'] = thresholds['split_variance']
+        if 'min_sample_count' in lifecycle:
+            merged['min_sample_count'] = lifecycle['min_sample_count']
+
+        return merged
     def consolidate_memory(
         self,
         new_trajectories: List[Trajectory],

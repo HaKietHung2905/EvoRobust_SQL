@@ -1,7 +1,3 @@
-"""
-src/generation/sql_generator.py  — complete fixed file
-"""
-
 import os
 import re
 import sqlite3
@@ -36,10 +32,23 @@ WIKISQL_ANNOTATION_RULES = """\
 
 4. COUNTING RECORDS — use COUNT(col), NEVER COUNT(*):
    "How many [entities]?" → SELECT COUNT(col) FROM wikisql_data WHERE ...
+   This also covers "total number of [entities]" / "number of [entities]" —
+   despite containing the word "total", these ask you to COUNT matching
+   rows, NOT sum a numeric column. "total number of X" is a COUNT trigger,
+   not a SUM trigger — it takes priority over rule 5 below whenever the
+   phrase "number of" is present.
+   Example: "What is the total number of goals scored by Messi?"
+            → SELECT COUNT(goals) FROM wikisql_data WHERE player = 'Messi'
+            (NOT SUM(goals) — "number of X" means count the rows, even
+            though "total" is also in the sentence)
 
 5. TOTAL/SUM OVER MULTIPLE ROWS — use SUM() only when the question asks
-   for a combined/total value across multiple matching rows
-   ("total", "combined", "sum of").
+   to add up a numeric quantity itself, with NO "number of" phrase present
+   ("total goals", "combined attendance", "sum of points").
+   Example: "What is the total attendance across all games?"
+            → SELECT SUM(attendance) FROM wikisql_data
+   Contrast with rule 4: "total NUMBER OF X" = COUNT; "total X" (X itself
+   is the quantity being added) = SUM.
 
 6. WHERE: include ALL filters stated, nothing more. No subqueries. No ORDER BY LIMIT 1.
 
@@ -48,11 +57,34 @@ WIKISQL_ANNOTATION_RULES = """\
 
 8. String values: single quotes. Numeric values: no quotes.
 
-DECISION ORDER: check rules 2/3/4/5 for explicit trigger words first.
+9. STRIP QUOTE MARKS FROM THE QUESTION TEXT — if the question itself
+   contains a value already wrapped in quote marks (straight or curly:
+   " " or " "), do NOT copy those quote characters into the WHERE value.
+   Only wrap the value in the single quotes SQL requires; drop any quote
+   characters that were part of the question's own wording.
+   Example: Q: '...first episode being "L.A."'
+            WHERE first_episode = 'L.A.'   ← correct, quotes from the
+            question text removed
+            WHERE first_episode = '"L.A."' ← WRONG, embedded quote marks
+            left in — this will not match the stored value
+
+DECISION ORDER: check rules 2/3/4/5 for explicit trigger words first —
+within that, check rule 4's "number of" phrase before rule 5's plain
+"total"/"combined", since "number of" always wins when both appear.
 If none apply, default to rule 1 (bare SELECT) — this is the MOST COMMON
 case. Do not add MAX/MIN/SUM/COUNT unless a trigger word is present.
+Always apply rule 9 regardless of which other rule fired.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
+
+# ──────────────────────────────────────────────────────────────────────────
+# NOTE: an earlier version of this file used a hard-coded per-db_id hint
+# dict here. Removed — it doesn't scale to real deployments with many
+# databases. Instead, _get_schema_string() below now surfaces sample column
+# values directly from the database, so the model sees the actual data
+# shape (e.g. that car_names.Make holds full trim strings, not just brand
+# names) without needing a hand-written note per database.
+
 
 def _is_server_error(exc: Exception) -> bool:
     _5xx = ("500","502","503","504","Internal Server Error","Bad Gateway",
@@ -458,12 +490,95 @@ class SQLGenerator:
             "9. COLUMN ORDER: exact order from the question\n"
             "10. STRING CASE: exact capitalisation from question in WHERE values\n"
             "11. HAVING vs WHERE: filter aggregates with HAVING after GROUP BY\n"
-            "12. SET OPERATORS: INTERSECT='both/shared', EXCEPT='but not/excluding', "
-            "UNION='either...or' — NEVER replace with self-JOIN\n"
+            "12. INTERSECT/UNION (see rule 16 for EXCEPT vs NOT IN specifically): "
+            "INTERSECT='both/shared', UNION='either...or' — NEVER replace with self-JOIN\n"
             "13. DISTINCT only when question says 'unique'/'distinct' — NEVER COUNT(DISTINCT col)\n"
             "14. ALIAS-COLUMN CHECK: before writing tN.column, verify that column "
             "literally belongs to the table aliased as tN in THIS query's FROM/JOIN — "
             "never borrow a column name from a different joined table.\n"
+            "15. GROUP BY ENTITY IDENTITY: when grouping to count/aggregate rows for an "
+            "entity whose name you are ALSO selecting from a joined table, GROUP BY that "
+            "table's id/primary-key column, NOT the display/name column — even though "
+            "rule 6 prefers bare names elsewhere. This matters when the join key is the "
+            "true grouping identity.\n"
+            "   BAD:  SELECT t1.name, COUNT(*) FROM stadium AS t1 JOIN concert AS t2 "
+            "ON t1.stadium_id = t2.stadium_id GROUP BY t1.name\n"
+            "   GOOD: SELECT t1.name, COUNT(*) FROM stadium AS t1 JOIN concert AS t2 "
+            "ON t1.stadium_id = t2.stadium_id GROUP BY t1.stadium_id\n"
+            "16. EXCEPT vs NOT IN — choose based on WHAT is being excluded:\n"
+            "   (a) Excluding whole rows of the SAME table/entity, where the two sides "
+            "being compared use the SAME select columns (e.g. 'stadium names' vs "
+            "'stadium names that had a 2014 concert') → use the literal set operator "
+            "(EXCEPT/INTERSECT) — do NOT rewrite as NOT IN/subquery.\n"
+            "       BAD:  SELECT name FROM stadium AS t1 WHERE t1.stadium_id NOT IN "
+            "(SELECT t2.stadium_id FROM concert AS t2 WHERE t2.year = 2014)\n"
+            "       GOOD: SELECT name FROM stadium EXCEPT SELECT t2.name FROM concert AS t1 "
+            "JOIN stadium AS t2 ON t1.stadium_id = t2.stadium_id WHERE t1.year = 2014\n"
+            "   (b) Excluding entities based on membership in a DIFFERENT joined "
+            "relationship — e.g. 'students who have a dog but do NOT have a cat' (the "
+            "exclusion condition comes through a join table, not a direct column on the "
+            "same row) → use a CORRELATED NOT IN subquery on the entity's id/primary "
+            "key. Do NOT use EXCEPT here — EXCEPT compares the SELECTed columns "
+            "directly, which silently produces wrong results whenever those columns "
+            "don't uniquely identify entity membership (e.g. an aggregate like avg(), "
+            "or a column that repeats across different entities).\n"
+            "       BAD:  SELECT avg(age) FROM student EXCEPT SELECT t2.age FROM has_pet "
+            "AS t1 JOIN student AS t2 ON t1.stuid = t2.stuid\n"
+            "       GOOD: SELECT avg(age) FROM student WHERE stuid NOT IN "
+            "(SELECT stuid FROM has_pet)\n"
+            "       GOOD: SELECT t1.fname, t1.age FROM student AS t1 JOIN has_pet AS t2 "
+            "ON t1.stuid = t2.stuid JOIN pets AS t3 ON t3.petid = t2.petid "
+            "WHERE t3.pettype = 'dog' AND t1.stuid NOT IN (SELECT t1.stuid FROM student "
+            "AS t1 JOIN has_pet AS t2 ON t1.stuid = t2.stuid JOIN pets AS t3 "
+            "ON t3.petid = t2.petid WHERE t3.pettype = 'cat')\n"
+            "   Rule of thumb: if the SELECT list alone would not uniquely determine "
+            "which row to exclude, use NOT IN on the id column, not EXCEPT.\n"
+            "17. FILTER-BY-EXTREME-VALUE SUBQUERY: when a WHERE clause needs to match "
+            "rows against 'the row with the highest/lowest X' (as a FILTER, not the "
+            "top-level answer), prefer a correlated subquery using ORDER BY ... LIMIT 1 "
+            "on the id column — same spirit as rule 7. Do NOT rewrite it as "
+            "WHERE X = (SELECT MAX(X)/MIN(X) ...).\n"
+            "   BAD:  SELECT COUNT(*) FROM concert AS t1 JOIN stadium AS t2 "
+            "ON t1.stadium_id = t2.stadium_id WHERE t2.capacity = (SELECT MAX(capacity) FROM stadium)\n"
+            "   GOOD: SELECT COUNT(*) FROM concert WHERE stadium_id = "
+            "(SELECT stadium_id FROM stadium ORDER BY capacity DESC LIMIT 1)\n"
+            "18. SUPERLATIVE DIRECTION — map the question's word to ORDER BY direction "
+            "explicitly, don't guess:\n"
+            "   DESC (biggest/most first): highest, most, greatest, largest, maximum, "
+            "latest, top\n"
+            "   ASC (smallest/least first): lowest, least, smallest, minimum, earliest, "
+            "shortest, youngest (smallest age)\n"
+            "   'the car with the GREATEST accelerate' → ORDER BY accelerate DESC LIMIT 1 "
+            "(NOT ASC).\n"
+            "19. EXACT SCHEMA COLUMN MATCH: before mapping a question phrase to a "
+            "column, scan the FULL column list given in the schema below. If the "
+            "schema already contains a column whose name directly matches the concept "
+            "asked (e.g. a column literally named 'average', 'song_name', 'model'), "
+            "use that EXACT column — do NOT substitute a similarly-named-but-different "
+            "column (e.g. using 'name' when the question means 'song_name'), and do "
+            "NOT recompute a value with a SQL function (e.g. AVG(capacity)) when the "
+            "schema already has a precomputed column with a matching name (e.g. a "
+            "column literally called 'average').\n"
+            "20. SELECT ONLY WHAT'S ASKED: do not add extra supporting columns (e.g. "
+            "COUNT(*), an aggregate, an id column) that the question did not request, "
+            "even if they seem helpful for context.\n"
+            "   Q: 'Which year had the most concerts?' → SELECT ONLY the year, do NOT "
+            "also SELECT COUNT(*).\n"
+            "21. JOIN ONLY VIA LISTED FOREIGN KEYS: only join two tables directly if "
+            "their connection is explicitly listed under 'Foreign Keys:' in the schema "
+            "below. If the tables you need are NOT listed as directly connected, they "
+            "are related through an INTERMEDIATE table — find the table that has a "
+            "listed foreign key to BOTH, and join through it (A→B→C), rather than "
+            "guessing a direct join between A and C using columns that merely have "
+            "similar names (e.g. both tables having an 'id' column does not mean they "
+            "are directly related).\n"
+            "22. TRUST THE SAMPLE VALUES: where the schema below shows example values "
+            "for a column, use them to judge what that column actually contains — a "
+            "column's NAME can be misleading (e.g. a column called 'Make' whose sample "
+            "values look like full model names, not just brand names). When a "
+            "question's value looks like it could belong to more than one column, "
+            "match it against the column whose SAMPLE VALUES actually contain that "
+            "kind of value, not the column whose name sounds closest in English.\n"
             "\nEXAMPLES:\n"
             "Q: Which model has the smallest horsepower?\n"
             "A: SELECT t1.model FROM car_names AS t1 JOIN cars_data AS t2 ON t1.makeid = t2.id "
@@ -473,6 +588,22 @@ class SQLGenerator:
             "Q: How many pets are owned by students older than 20?\n"
             "A: SELECT COUNT(*) FROM has_pet AS t1 JOIN student AS t2 ON t1.stuid = t2.stuid "
             "WHERE t2.age > 20\n\n"
+            "Q: Show the stadium name and number of concerts for each stadium.\n"
+            "A: SELECT t1.name, COUNT(*) FROM stadium AS t1 JOIN concert AS t2 "
+            "ON t1.stadium_id = t2.stadium_id GROUP BY t1.stadium_id\n\n"
+            "Q: Show names of stadiums without a concert in 2014.\n"
+            "A: SELECT name FROM stadium EXCEPT SELECT t2.name FROM concert AS t1 "
+            "JOIN stadium AS t2 ON t1.stadium_id = t2.stadium_id WHERE t1.year = 2014\n\n"
+            "Q: How many concerts happened in the stadium with the highest capacity?\n"
+            "A: SELECT COUNT(*) FROM concert WHERE stadium_id = "
+            "(SELECT stadium_id FROM stadium ORDER BY capacity DESC LIMIT 1)\n\n"
+            "Q: Find the first name and age of students who have a dog but do not have "
+            "a cat as a pet.\n"
+            "A: SELECT t1.fname, t1.age FROM student AS t1 JOIN has_pet AS t2 "
+            "ON t1.stuid = t2.stuid JOIN pets AS t3 ON t3.petid = t2.petid "
+            "WHERE t3.pettype = 'dog' AND t1.stuid NOT IN (SELECT t1.stuid FROM student "
+            "AS t1 JOIN has_pet AS t2 ON t1.stuid = t2.stuid JOIN pets AS t3 "
+            "ON t3.petid = t2.petid WHERE t3.pettype = 'cat')\n\n"
         )
         schema_block = f"Database Schema:\n{schema_str}\n\n"
         tail = f"Question: {question}\n\nSQL:"
@@ -533,6 +664,15 @@ class SQLGenerator:
             "A: SELECT COUNT(player) FROM wikisql_data WHERE years_in_toronto = '2005-06'\n\n"
             "Q: What player played guard for Toronto in 1996-97?\n"
             "A: SELECT player FROM wikisql_data WHERE position = 'Guard'\n\n"
+            "Q: What is the total number of goals scored by Messi?\n"
+            "A: SELECT COUNT(goals) FROM wikisql_data WHERE player = 'Messi'\n"
+            "   (COUNT, not SUM — \"number of X\" means count rows)\n\n"
+            "Q: What is the total attendance across all games in 2010?\n"
+            "A: SELECT SUM(attendance) FROM wikisql_data WHERE year = '2010'\n"
+            "   (SUM — no \"number of\" phrase, attendance itself is being added)\n\n"
+            "Q: Who directed the episode with first episode being \"L.A.\"?\n"
+            "A: SELECT director FROM wikisql_data WHERE first_episode = 'L.A.'\n"
+            "   (quote marks from the question text stripped, not copied in)\n\n"
             f"{self._format_semantic_hints_block(semantic_hints)}"
             f"{self._format_few_shot_block(few_shot_examples)}"
             f"{self._format_strategy_block(strategy_hints)}"
@@ -608,15 +748,31 @@ class SQLGenerator:
     # ──────────────────────────────────────────────────────────────────────────
 
     def _get_schema_string(self, db_path: str) -> str:
+        """
+        Build the schema block shown to the model. Beyond table/column names
+        and foreign keys, this also samples a few distinct values per TEXT
+        column directly from the database — this is what lets the model
+        discover, on its own and for ANY database, quirks like a column
+        named 'Make' actually holding full model-like strings, instead of
+        relying on a hand-written note that would only cover the one
+        database someone happened to notice and write a note for.
+        """
         try:
             schema_obj = load_schema(db_path)
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+
             lines = []
             for table, cols in schema_obj.schema.items():
                 lines.append(f"Table: {table}")
                 lines.append(f"Columns: {', '.join(cols)}")
+
+                sample_lines = self._get_sample_values(cursor, table)
+                if sample_lines:
+                    lines.append("Sample values:")
+                    lines.extend(sample_lines)
                 lines.append("")
-            conn = sqlite3.connect(db_path)
-            cursor = conn.cursor()
+
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
             tables = [r[0] for r in cursor.fetchall()]
             fk_lines = []
@@ -626,12 +782,50 @@ class SQLGenerator:
                     fk_lines.append(f"  {table}.{fk[3]} → {fk[2]}.{fk[4]}")
             conn.close()
             if fk_lines:
-                lines.append("Foreign Keys:")
+                lines.append("Foreign Keys (these are the ONLY direct table "
+                              "relationships — tables not listed together here "
+                              "must be joined through an intermediate table, "
+                              "see rule 21):")
                 lines.extend(fk_lines)
             return "\n".join(lines)
         except Exception as e:
             logger.error(f"Error loading schema: {e}")
             return ""
+
+    def _get_sample_values(
+        self, cursor: sqlite3.Cursor, table: str,
+        max_cols: int = 6, max_values: int = 3, max_value_len: int = 40,
+    ) -> List[str]:
+        """Sample a few distinct values for each TEXT/VARCHAR/CHAR column of
+        `table`, capped so the schema block doesn't blow up on wide tables.
+        Silently skips a column/table on any error (missing table, locked
+        db, binary/blob content, etc) — this is a best-effort aid for the
+        prompt, not something generation should ever hard-fail on."""
+        try:
+            cursor.execute(f'PRAGMA table_info("{table}")')
+            columns = cursor.fetchall()
+        except Exception:
+            return []
+
+        text_cols = [
+            col[1] for col in columns
+            if any(t in (col[2] or "").upper() for t in ("CHAR", "TEXT", "CLOB"))
+        ][:max_cols]
+
+        lines = []
+        for col in text_cols:
+            try:
+                cursor.execute(
+                    f'SELECT DISTINCT "{col}" FROM "{table}" '
+                    f'WHERE "{col}" IS NOT NULL LIMIT {max_values}'
+                )
+                values = [str(r[0])[:max_value_len] for r in cursor.fetchall() if r[0] is not None]
+            except Exception:
+                continue
+            if values:
+                shown = ", ".join(f"'{v}'" for v in values)
+                lines.append(f"  {table}.{col}: {shown}")
+        return lines
 
     def _get_minimal_schema_string(self, db_path: str) -> str:
         try:
