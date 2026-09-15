@@ -11,7 +11,7 @@ comparing {agg, sel, conds} JSON objects — same as DIN-SQL / DAIL-SQL baseline
 
 Usage:
   python scripts/evaluate_wikisql.py \
-      --gold  data/raw/wikisql/dev_spider_format.json \
+      --gold  data/raw/wikisql/dev_wiki_format.json \
       --table data/raw/wikisql/tables.json \
       --predict results/predictions_wikisql_v2.tsv \
       --etype all
@@ -481,29 +481,101 @@ def _sem_normalise_value(v: Any) -> Any:
     return re.sub(r"[\s,]+", "", v_lower)
 
 
+# def _sem_values_match(v1: Any, v2: Any) -> bool:
+#     n1, n2 = _sem_normalise_value(v1), _sem_normalise_value(v2)
+#     if n1 == n2: return True
+#     try:
+#         return abs(float(n1) - float(n2)) < 1e-9
+#     except (ValueError, TypeError):
+#         pass
+#     if isinstance(n1, str) and isinstance(n2, str):
+#         s1, s2 = str(n1).lower(), str(n2).lower()
+#         return s1.startswith(s2) or s2.startswith(s1)
+#     return False
+
+
+# def _sem_conds_match(pred_conds: List, gold_conds: List) -> bool:
+#     """Order-insensitive condition comparison. Pred may have extra conditions."""
+#     if len(pred_conds) < len(gold_conds):
+#         return False
+
+#     def _norm(c):
+#         val = _sem_normalise_value(c[2])
+#         if isinstance(val, str):
+#             try: val = float(val) if "." in val else int(val)
+#             except (ValueError, TypeError): pass
+#         return (c[0], c[1], val)
+
+#     gold_normed  = [_norm(c) for c in gold_conds]
+#     pred_normed  = [_norm(c) for c in pred_conds]
+#     matched_pred = [False] * len(pred_normed)
+
+#     for gc in gold_normed:
+#         found = False
+#         # Pass 1: exact col-index + operator + value
+#         for i, pc in enumerate(pred_normed):
+#             if matched_pred[i]: continue
+#             if pc[0] == gc[0] and pc[1] == gc[1] and _sem_values_match(pc[2], gc[2]):
+#                 matched_pred[i] = True; found = True; break
+#         # Pass 2: soft col — operator + value any column
+#         if not found:
+#             for i, pc in enumerate(pred_normed):
+#                 if matched_pred[i]: continue
+#                 if pc[1] == gc[1] and _sem_values_match(pc[2], gc[2]):
+#                     matched_pred[i] = True; found = True; break
+#         # Pass 3: col + value match, ignore operator
+#         # Covers LIKE vs =, >= vs >, and other SQL-equivalent operator forms.
+#         # LIKE 'x' (no wildcard) is semantically = 'x' in SQL.
+#         if not found:
+#             for i, pc in enumerate(pred_normed):
+#                 if matched_pred[i]: continue
+#                 if pc[0] == gc[0] and _sem_values_match(pc[2], gc[2]):
+#                     matched_pred[i] = True; found = True; break
+#         if not found:
+#             return False
+#     return True
+
 def _sem_values_match(v1: Any, v2: Any) -> bool:
+    """STRICT value equivalence for structural EM (Zhong et al. 2017).
+
+    Only accepts genuine equivalence after normalization (numeric equality
+    or normalized-string equality via _sem_normalise_value, which already
+    handles ISO<->readable dates and number-format variants). Does NOT
+    accept prefix match, substring match, or comma-split partial match —
+    those allowed semantically different values to count as "equal".
+    """
     n1, n2 = _sem_normalise_value(v1), _sem_normalise_value(v2)
-    if n1 == n2: return True
+    if n1 == n2:
+        return True
     try:
         return abs(float(n1) - float(n2)) < 1e-9
     except (ValueError, TypeError):
-        pass
-    if isinstance(n1, str) and isinstance(n2, str):
-        s1, s2 = str(n1).lower(), str(n2).lower()
-        return s1.startswith(s2) or s2.startswith(s1)
-    return False
+        return False
 
 
 def _sem_conds_match(pred_conds: List, gold_conds: List) -> bool:
-    """Order-insensitive condition comparison. Pred may have extra conditions."""
-    if len(pred_conds) < len(gold_conds):
+    """STRICT exact-set condition matching (Zhong et al. 2017 official).
+
+    Requirements (all must hold):
+      1. Same number of conditions — NO subset/superset allowed.
+         (Previously: `if len(pred_conds) < len(gold_conds): return False`
+         let predictions with EXTRA WHERE clauses still count as correct,
+         even though extra filters change the actual query result set.)
+      2. Each gold condition maps to exactly one distinct predicted
+         condition with the SAME column index AND SAME operator.
+      3. No "soft column" pass (matching by value only, ignoring column).
+      4. No "ignore operator" pass (e.g. LIKE treated as '=').
+    """
+    if len(pred_conds) != len(gold_conds):
         return False
 
     def _norm(c):
         val = _sem_normalise_value(c[2])
         if isinstance(val, str):
-            try: val = float(val) if "." in val else int(val)
-            except (ValueError, TypeError): pass
+            try:
+                val = float(val) if "." in val else int(val)
+            except (ValueError, TypeError):
+                pass
         return (c[0], c[1], val)
 
     gold_normed  = [_norm(c) for c in gold_conds]
@@ -512,29 +584,17 @@ def _sem_conds_match(pred_conds: List, gold_conds: List) -> bool:
 
     for gc in gold_normed:
         found = False
-        # Pass 1: exact col-index + operator + value
         for i, pc in enumerate(pred_normed):
-            if matched_pred[i]: continue
+            if matched_pred[i]:
+                continue
             if pc[0] == gc[0] and pc[1] == gc[1] and _sem_values_match(pc[2], gc[2]):
-                matched_pred[i] = True; found = True; break
-        # Pass 2: soft col — operator + value any column
-        if not found:
-            for i, pc in enumerate(pred_normed):
-                if matched_pred[i]: continue
-                if pc[1] == gc[1] and _sem_values_match(pc[2], gc[2]):
-                    matched_pred[i] = True; found = True; break
-        # Pass 3: col + value match, ignore operator
-        # Covers LIKE vs =, >= vs >, and other SQL-equivalent operator forms.
-        # LIKE 'x' (no wildcard) is semantically = 'x' in SQL.
-        if not found:
-            for i, pc in enumerate(pred_normed):
-                if matched_pred[i]: continue
-                if pc[0] == gc[0] and _sem_values_match(pc[2], gc[2]):
-                    matched_pred[i] = True; found = True; break
+                matched_pred[i] = True
+                found = True
+                break
         if not found:
             return False
-    return True
 
+    return True
 
 def _sem_normalise_value_for_parse(raw: str) -> Any:
     v = _sem_strip_quotes(raw).strip()
@@ -698,7 +758,7 @@ def compute_wikisql_structural_em(
 ) -> Dict[str, Any]:
     """
     Compute official WikiSQL structural EM (Zhong et al. 2017).
-    Accepts original dev.json (sql as dict) OR converted spider-format (sql as string).
+    Accepts original dev.json (sql as dict) OR converted wiki-format (sql as string).
 
     Returns dict with structural_em, parse_rate, agg/sel/cond accuracy,
     failure breakdown, and per_query list.
@@ -775,13 +835,13 @@ def compute_wikisql_structural_em(
             # one row matches — a well-known WikiSQL annotation quirk.
             # Relax: if pred has no agg (0) and gold has MAX(1)/MIN(2) AND
             # gold has non-empty conditions (not a true table-wide aggregate).
-            if not agg_ok:
-                _MAX = _SEM_AGG_OPS.index("MAX")   # 1
-                _MIN = _SEM_AGG_OPS.index("MIN")   # 2
-                if (pred_struct["agg"] == 0
-                        and gold_struct["agg"] in (_MAX, _MIN)
-                        and gold_struct["conds"]):
-                    agg_ok = True
+            # if not agg_ok:
+            #     _MAX = _SEM_AGG_OPS.index("MAX")   # 1
+            #     _MIN = _SEM_AGG_OPS.index("MIN")   # 2
+            #     if (pred_struct["agg"] == 0
+            #             and gold_struct["agg"] in (_MAX, _MIN)
+            #             and gold_struct["conds"]):
+            #         agg_ok = True
 
             # COUNT(*) — sel column irrelevant when both sides use COUNT
             if (pred_struct.get("count_star")
@@ -1191,7 +1251,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
 
     parser.add_argument("--gold",      required=True,
-                        help="Path to WikiSQL gold file (dev_spider_format.json or dev.json)")
+                        help="Path to WikiSQL gold file (dev_wiki_format.json or dev.json)")
     parser.add_argument("--table",     required=True, help="Path to tables.json")
     parser.add_argument("--predict",   default=None,  help="Path to predictions TSV")
     parser.add_argument("--questions", default=None)
@@ -1225,10 +1285,10 @@ def main():
     if not args.use_langchain and not args.predict:
         parser.error("Either --use_langchain or --predict is required")
 
-    # ── Auto-detect original dev.json from spider-format path ─────────────────
+    # ── Auto-detect original dev.json from wiki-format path ─────────────────
     gold_original = args.gold
-    if args.gold.endswith("_spider_format.json") or args.gold.endswith("_converted.json"):
-        _stem = args.gold.replace("_spider_format", "").replace("_converted", "")
+    if args.gold.endswith("_wiki_format.json") or args.gold.endswith("_converted.json"):
+        _stem = args.gold.replace("_wiki_format", "").replace("_converted", "")
         if Path(_stem).exists():
             gold_original = _stem
 
@@ -1241,11 +1301,18 @@ def main():
 
     # === STEP 2: Convert gold SQL ===
     logger.info("\n" + "=" * 80)
-    logger.info("STEP 2: Converting WikiSQL gold SQL to Spider format")
+    logger.info("STEP 2: Converting WikiSQL gold SQL to wiki-format")
     logger.info("=" * 80)
-    converted_gold = args.gold.replace(".json", "_spider_format.json")
-    converted_gold = os.path.join("./data/raw/wikisql", os.path.basename(converted_gold))
-    if not converted_gold.endswith("_spider_format_spider_format.json"):
+    # If args.gold is ALREADY the converted wiki-format file (e.g. the same
+    # path used as --questions for generate_predictions.py), reuse it
+    # directly instead of deriving a doubled-suffix path like
+    # "dev_wiki_format_wiki_format.json", which would never exist and would
+    # make evaluate() fail at STEP 6 below.
+    if args.gold.endswith("_wiki_format.json"):
+        converted_gold = args.gold
+    else:
+        converted_gold = args.gold.replace(".json", "_wiki_format.json")
+        converted_gold = os.path.join("./data/raw/wikisql", os.path.basename(converted_gold))
         convert_wikisql_gold_to_spider_format(
             gold_file=gold_original, output_file=converted_gold, limit=args.limit)
 

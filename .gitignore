@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -218,6 +219,8 @@ __marimo__/
 .streamlit/secrets.toml
 
 
+=======
+>>>>>>> upstream/master
 __pycache__/
 *.py[codz]
 *$py.class

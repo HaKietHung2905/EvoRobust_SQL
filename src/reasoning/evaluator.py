@@ -33,6 +33,14 @@ from utils.eval_utils import normalize_sql_for_evaluation
 
 logger = get_logger(__name__)
 
+_SQL_KEYWORDS = {
+    "select", "from", "where", "and", "or", "not", "in", "is", "null",
+    "like", "between", "order", "by", "group", "having", "limit",
+    "asc", "desc", "distinct", "as", "count", "sum", "avg", "max", "min",
+    "join", "on", "union", "intersect", "except", "case", "when", "then",
+    "else", "end", "exists", "all", "any",
+}
+
 # Import semantic pipeline
 try:
     from src.semantic.semantic_pipeline import SemanticPipeline
@@ -75,28 +83,33 @@ class RateLimiter:
 
 rate_limiter = RateLimiter(requests_per_minute=30)
 def _normalize_column_underscores(sql: str, schema) -> str:
-    """
-    Collapse runs of underscores in identifier tokens so that LLM artifacts
-    like  target_code__allied_  or  viewers__millions_  resolve to real schema
-    columns before execution against SQLite.
-
-    Only touches tokens outside string literals that contain double underscores
-    or trailing underscores, and only replaces them when the collapsed form
-    exists in the schema.
-    """
     if not sql:
         return sql
 
-    # Flat set of all known column names
-    known_cols = set()
+    real_cols = []
     for cols in schema.schema.values():
-        for c in cols:
-            known_cols.add(c.lower())
+        real_cols.extend(cols)
+    if not real_cols:
+        return sql
 
-    # Walk char-by-char, skipping string literals
+    table_names_lower = {t.lower() for t in schema.schema.keys()}
+    real_cols_lower = {c.lower(): c for c in real_cols}
+
+    def _collapsed(s: str) -> str:
+        return re.sub(r'_+', '_', s).strip('_').lower()
+
+    collapsed_to_real = {}
+    for c in real_cols:
+        collapsed_to_real.setdefault(_collapsed(c), c)
+
+    def _jaccard(a: str, b: str) -> float:
+        sa, sb = set(a.split('_')) - {''}, set(b.split('_')) - {''}
+        if not sa or not sb:
+            return 0.0
+        return len(sa & sb) / len(sa | sb)
+
     result = []
-    i = 0
-    n = len(sql)
+    i, n = 0, len(sql)
 
     while i < n:
         ch = sql[i]
@@ -110,7 +123,7 @@ def _normalize_column_underscores(sql: str, schema) -> str:
                 result.append(c)
                 i += 1
                 if c == "'":
-                    if i < n and sql[i] == "'":  # escaped ''
+                    if i < n and sql[i] == "'":
                         result.append("'")
                         i += 1
                         continue
@@ -124,14 +137,50 @@ def _normalize_column_underscores(sql: str, schema) -> str:
                 j += 1
             tok = sql[i:j]
             i = j
+            tok_low = tok.lower()
 
-            # Only attempt collapse if token has __ or trailing _
-            if '__' in tok or tok.endswith('_'):
-                collapsed = re.sub(r'_+', '_', tok).strip('_')
-                if collapsed.lower() in known_cols:
-                    result.append(collapsed)
+            if (tok_low in _SQL_KEYWORDS
+                    or tok_low in table_names_lower
+                    or tok_low.isdigit()):
+                result.append(tok)
+                continue
+
+            # Already an exact (case-insensitive) column name
+            if tok_low in real_cols_lower:
+                result.append(real_cols_lower[tok_low])
+                continue
+
+            collapsed = _collapsed(tok)
+
+            # Pass 1: underscore-collapsed equality (handles BOTH
+            # directions of underscore-count mismatch)
+            if collapsed in collapsed_to_real:
+                result.append(collapsed_to_real[collapsed])
+                continue
+
+            # Pass 2: token-Jaccard >= 0.6 (matches _sem_col_index Case 6)
+            best_col, best_j = None, 0.0
+            for c in real_cols:
+                jac = _jaccard(collapsed, _collapsed(c))
+                if jac > best_j:
+                    best_j, best_col = jac, c
+            if best_col is not None and best_j >= 0.6:
+                result.append(best_col)
+                continue
+
+            # Pass 3: prefix/substring match (matches _sem_col_index Case 7)
+            # e.g. "No" (real) vs "no_col" (predicted)
+            if len(collapsed) >= 2:
+                for c in real_cols:
+                    c_norm = _collapsed(c)
+                    if c_norm.startswith(collapsed) or collapsed.startswith(c_norm):
+                        best_col = c
+                        break
+                if best_col is not None:
+                    result.append(best_col)
                     continue
 
+            # No confident match — để nguyên, cho thực thi lỗi tự nhiên
             result.append(tok)
             continue
 
@@ -386,7 +435,9 @@ def evaluate(
             for item in data:
                 glist.append([item['query'], item['db_id']])
     else:
-        glist = load_gold_queries(gold)
+        #glist = load_gold_queries(gold)
+        raw_glist = load_gold_queries(gold)
+        glist = [turn for session in raw_glist for turn in session]
 
     if limit:
         glist = glist[:limit]

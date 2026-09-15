@@ -1,28 +1,22 @@
 ================================================================================
 SPIDER EVALUATION SUMMARY REPORT
-=======
-Generated : 2026-08-26 07:14:54
->>>>>>> upstream/master
-Results   : results/evaluation_results.json
+Generated : 2026-08-19 10:30:45
+Results   : output/robustness_smoke/comparison/eval_baseline.json
 ================================================================================
 
 MAIN METRICS
 ----------------------------------------
-=======
-  Exact Match Accuracy : 70.31%  (70.3%)
-  Execution Accuracy   : 88.88%  (88.9%)
->>>>>>> upstream/master
+  Exact Match Accuracy : 75.00%  (75.0%)
+  Execution Accuracy   : 80.00%  (80.0%)
   Total Evaluated      : 0
 
 PER-DIFFICULTY BREAKDOWN
 ----------------------------------------
-=======
-  easy     | count=116   | EM=85.34% | EX=92.24%
-  medium   | count=358   | EM=87.43% | EX=93.85%
-  hard     | count=293   | EM=62.12% | EX=86.01%
-  extra    | count=265   | EM=50.19% | EX=84.53%
-  all      | count=1034  | EM=70.31% | EX=88.88%
->>>>>>> upstream/master
+  easy     | count=2     | EM=100.00% | EX=100.00%
+  medium   | count=14    | EM=64.29% | EX=71.43%
+  hard     | count=0     | EM=0.00% | EX=0.00%
+  extra    | count=4     | EM=100.00% | EX=100.00%
+  all      | count=20    | EM=75.00% | EX=80.00%
 
 ================================================================================
 END OF REPORT
