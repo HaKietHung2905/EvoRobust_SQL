@@ -1,10 +1,3 @@
-<<<<<<< HEAD
-"""
-src/generation/sql_generator.py  — complete fixed file
-"""
-
-=======
->>>>>>> upstream/master
 import os
 import re
 import sqlite3
@@ -39,12 +32,6 @@ WIKISQL_ANNOTATION_RULES = """\
 
 4. COUNTING RECORDS — use COUNT(col), NEVER COUNT(*):
    "How many [entities]?" → SELECT COUNT(col) FROM wikisql_data WHERE ...
-<<<<<<< HEAD
-
-5. TOTAL/SUM OVER MULTIPLE ROWS — use SUM() only when the question asks
-   for a combined/total value across multiple matching rows
-   ("total", "combined", "sum of").
-=======
    This also covers "total number of [entities]" / "number of [entities]" —
    despite containing the word "total", these ask you to COUNT matching
    rows, NOT sum a numeric column. "total number of X" is a COUNT trigger,
@@ -62,7 +49,6 @@ WIKISQL_ANNOTATION_RULES = """\
             → SELECT SUM(attendance) FROM wikisql_data
    Contrast with rule 4: "total NUMBER OF X" = COUNT; "total X" (X itself
    is the quantity being added) = SUM.
->>>>>>> upstream/master
 
 6. WHERE: include ALL filters stated, nothing more. No subqueries. No ORDER BY LIMIT 1.
 
@@ -71,14 +57,6 @@ WIKISQL_ANNOTATION_RULES = """\
 
 8. String values: single quotes. Numeric values: no quotes.
 
-<<<<<<< HEAD
-DECISION ORDER: check rules 2/3/4/5 for explicit trigger words first.
-If none apply, default to rule 1 (bare SELECT) — this is the MOST COMMON
-case. Do not add MAX/MIN/SUM/COUNT unless a trigger word is present.
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"""
-
-=======
 9. STRIP QUOTE MARKS FROM THE QUESTION TEXT — if the question itself
    contains a value already wrapped in quote marks (straight or curly:
    " " or " "), do NOT copy those quote characters into the WHERE value.
@@ -108,7 +86,6 @@ Always apply rule 9 regardless of which other rule fired.
 # names) without needing a hand-written note per database.
 
 
->>>>>>> upstream/master
 def _is_server_error(exc: Exception) -> bool:
     _5xx = ("500","502","503","504","Internal Server Error","Bad Gateway",
             "Service Unavailable","Gateway Timeout")
@@ -513,13 +490,8 @@ class SQLGenerator:
             "9. COLUMN ORDER: exact order from the question\n"
             "10. STRING CASE: exact capitalisation from question in WHERE values\n"
             "11. HAVING vs WHERE: filter aggregates with HAVING after GROUP BY\n"
-<<<<<<< HEAD
-            "12. SET OPERATORS: INTERSECT='both/shared', EXCEPT='but not/excluding', "
-            "UNION='either...or' — NEVER replace with self-JOIN\n"
-=======
             "12. INTERSECT/UNION (see rule 16 for EXCEPT vs NOT IN specifically): "
             "INTERSECT='both/shared', UNION='either...or' — NEVER replace with self-JOIN\n"
->>>>>>> upstream/master
             "13. DISTINCT only when question says 'unique'/'distinct' — NEVER COUNT(DISTINCT col)\n"
             "14. ALIAS-COLUMN CHECK: before writing tN.column, verify that column "
             "literally belongs to the table aliased as tN in THIS query's FROM/JOIN — "
@@ -533,17 +505,6 @@ class SQLGenerator:
             "ON t1.stadium_id = t2.stadium_id GROUP BY t1.name\n"
             "   GOOD: SELECT t1.name, COUNT(*) FROM stadium AS t1 JOIN concert AS t2 "
             "ON t1.stadium_id = t2.stadium_id GROUP BY t1.stadium_id\n"
-<<<<<<< HEAD
-            "16. SET OPERATORS — DO NOT SUBSTITUTE WITH NOT IN/subqueries either: the "
-            "same restriction in rule 12 (no self-JOIN) also applies to NOT IN / nested "
-            "IN subqueries. If the question implies 'both X and Y' (INTERSECT), 'X but "
-            "not Y' (EXCEPT), or 'either X or Y' (UNION) over the SAME table, use the "
-            "literal set operator — do not rewrite as NOT IN/IN (SELECT ...).\n"
-            "   BAD:  SELECT name FROM stadium AS t1 WHERE t1.stadium_id NOT IN "
-            "(SELECT t2.stadium_id FROM concert AS t2 WHERE t2.year = 2014)\n"
-            "   GOOD: SELECT name FROM stadium EXCEPT SELECT t2.name FROM concert AS t1 "
-            "JOIN stadium AS t2 ON t1.stadium_id = t2.stadium_id WHERE t1.year = 2014\n"
-=======
             "16. EXCEPT vs NOT IN — choose based on WHAT is being excluded:\n"
             "   (a) Excluding whole rows of the SAME table/entity, where the two sides "
             "being compared use the SAME select columns (e.g. 'stadium names' vs "
@@ -572,7 +533,6 @@ class SQLGenerator:
             "ON t3.petid = t2.petid WHERE t3.pettype = 'cat')\n"
             "   Rule of thumb: if the SELECT list alone would not uniquely determine "
             "which row to exclude, use NOT IN on the id column, not EXCEPT.\n"
->>>>>>> upstream/master
             "17. FILTER-BY-EXTREME-VALUE SUBQUERY: when a WHERE clause needs to match "
             "rows against 'the row with the highest/lowest X' (as a FILTER, not the "
             "top-level answer), prefer a correlated subquery using ORDER BY ... LIMIT 1 "
@@ -582,8 +542,6 @@ class SQLGenerator:
             "ON t1.stadium_id = t2.stadium_id WHERE t2.capacity = (SELECT MAX(capacity) FROM stadium)\n"
             "   GOOD: SELECT COUNT(*) FROM concert WHERE stadium_id = "
             "(SELECT stadium_id FROM stadium ORDER BY capacity DESC LIMIT 1)\n"
-<<<<<<< HEAD
-=======
             "18. SUPERLATIVE DIRECTION — map the question's word to ORDER BY direction "
             "explicitly, don't guess:\n"
             "   DESC (biggest/most first): highest, most, greatest, largest, maximum, "
@@ -621,7 +579,6 @@ class SQLGenerator:
             "question's value looks like it could belong to more than one column, "
             "match it against the column whose SAMPLE VALUES actually contain that "
             "kind of value, not the column whose name sounds closest in English.\n"
->>>>>>> upstream/master
             "\nEXAMPLES:\n"
             "Q: Which model has the smallest horsepower?\n"
             "A: SELECT t1.model FROM car_names AS t1 JOIN cars_data AS t2 ON t1.makeid = t2.id "
@@ -640,8 +597,6 @@ class SQLGenerator:
             "Q: How many concerts happened in the stadium with the highest capacity?\n"
             "A: SELECT COUNT(*) FROM concert WHERE stadium_id = "
             "(SELECT stadium_id FROM stadium ORDER BY capacity DESC LIMIT 1)\n\n"
-<<<<<<< HEAD
-=======
             "Q: Find the first name and age of students who have a dog but do not have "
             "a cat as a pet.\n"
             "A: SELECT t1.fname, t1.age FROM student AS t1 JOIN has_pet AS t2 "
@@ -649,7 +604,6 @@ class SQLGenerator:
             "WHERE t3.pettype = 'dog' AND t1.stuid NOT IN (SELECT t1.stuid FROM student "
             "AS t1 JOIN has_pet AS t2 ON t1.stuid = t2.stuid JOIN pets AS t3 "
             "ON t3.petid = t2.petid WHERE t3.pettype = 'cat')\n\n"
->>>>>>> upstream/master
         )
         schema_block = f"Database Schema:\n{schema_str}\n\n"
         tail = f"Question: {question}\n\nSQL:"
@@ -794,10 +748,6 @@ class SQLGenerator:
     # ──────────────────────────────────────────────────────────────────────────
 
     def _get_schema_string(self, db_path: str) -> str:
-<<<<<<< HEAD
-        try:
-            schema_obj = load_schema(db_path)
-=======
         """
         Build the schema block shown to the model. Beyond table/column names
         and foreign keys, this also samples a few distinct values per TEXT
@@ -812,16 +762,10 @@ class SQLGenerator:
             conn = sqlite3.connect(db_path)
             cursor = conn.cursor()
 
->>>>>>> upstream/master
             lines = []
             for table, cols in schema_obj.schema.items():
                 lines.append(f"Table: {table}")
                 lines.append(f"Columns: {', '.join(cols)}")
-<<<<<<< HEAD
-                lines.append("")
-            conn = sqlite3.connect(db_path)
-            cursor = conn.cursor()
-=======
 
                 sample_lines = self._get_sample_values(cursor, table)
                 if sample_lines:
@@ -829,7 +773,6 @@ class SQLGenerator:
                     lines.extend(sample_lines)
                 lines.append("")
 
->>>>>>> upstream/master
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
             tables = [r[0] for r in cursor.fetchall()]
             fk_lines = []
@@ -839,22 +782,16 @@ class SQLGenerator:
                     fk_lines.append(f"  {table}.{fk[3]} → {fk[2]}.{fk[4]}")
             conn.close()
             if fk_lines:
-<<<<<<< HEAD
-                lines.append("Foreign Keys:")
-=======
                 lines.append("Foreign Keys (these are the ONLY direct table "
                               "relationships — tables not listed together here "
                               "must be joined through an intermediate table, "
                               "see rule 21):")
->>>>>>> upstream/master
                 lines.extend(fk_lines)
             return "\n".join(lines)
         except Exception as e:
             logger.error(f"Error loading schema: {e}")
             return ""
 
-<<<<<<< HEAD
-=======
     def _get_sample_values(
         self, cursor: sqlite3.Cursor, table: str,
         max_cols: int = 6, max_values: int = 3, max_value_len: int = 40,
@@ -890,7 +827,6 @@ class SQLGenerator:
                 lines.append(f"  {table}.{col}: {shown}")
         return lines
 
->>>>>>> upstream/master
     def _get_minimal_schema_string(self, db_path: str) -> str:
         try:
             conn   = sqlite3.connect(db_path)

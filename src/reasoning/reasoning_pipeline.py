@@ -92,8 +92,6 @@ class ReasoningBankPipeline:
         self.config = self._default_config()
         if config:
             self.config.update(config)
-<<<<<<< HEAD
-=======
             experimental = config.get('experimental', {}) or {}
             self.config.update({
                 k: v for k, v in experimental.items()
@@ -104,7 +102,6 @@ class ReasoningBankPipeline:
                     'self_consistency_max_confidence',
                 )
             })
->>>>>>> upstream/master
 
         logger.info("Initializing ReasoningBank Pipeline...")
 
@@ -223,11 +220,7 @@ class ReasoningBankPipeline:
                 logger.debug(f"Strategy retrieval failed (non-critical): {e}")
 
         # Step 2: Decide scaling
-<<<<<<< HEAD
-        use_scaling = (
-=======
         use_scaling = self.config.get('enable_test_time_scaling', False) and (
->>>>>>> upstream/master
             self._should_use_test_time_scaling(
                 semantic_analysis=semantic_analysis,
                 strategies_used=strategies_used
