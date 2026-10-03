@@ -4,8 +4,15 @@ compare_configs.py
 Phase 3: Run the four-way ablation (baseline / +Semantic RAG / +ReasoningBank
 / +both) against the FIXED noisy_dev.json produced by Phase 2, by shelling
 out to the project's existing scripts/generate_predictions.py and
-scripts/evaluate_spider.py — unmodified, per project convention. Produces a
-markdown + JSON comparison report.
+scripts/evaluate_spider.py or scripts/evaluate_wikisql.py — unmodified, per
+project convention. Produces a markdown + JSON comparison report.
+
+Resumable by design: a config already fully evaluated (eval_{name}.json
+exists) is skipped entirely; a config with a partially-generated predictions
+TSV is continued via generate_predictions.py's own --resume (line-buffered,
+safe to interrupt anytime). This means re-running the exact same command
+after any pause — minutes or many hours — picks up exactly where it left
+off, without any extra flags.
 
 Flag mapping (confirmed against generate_predictions.py / evaluate_spider.py):
     Semantic RAG   -> --use_chromadb (+ --top_k, --chromadb_persist_dir)
@@ -13,11 +20,8 @@ Flag mapping (confirmed against generate_predictions.py / evaluate_spider.py):
     (--use_semantic is a separate rule-based Semantic Layer component, not
     part of this ablation, so it is intentionally left off in all 4 configs.)
 
-Usage:
-    python -m src.robustness.compare_configs \
-        --noisy_questions output/robustness/noisy_dev.json \
-        --db data/spider/database \
-        --output_dir output/robustness/comparison
+Dataset routing: "wikisql" substring convention (same as generate_predictions.py)
+routes to scripts/evaluate_wikisql.py (--table required); otherwise Spider.
 """
 import argparse
 import json
@@ -42,6 +46,14 @@ def _run(cmd: List[str]) -> None:
         raise RuntimeError(f"Command failed (exit {result.returncode}): {' '.join(cmd)}")
 
 
+def _detect_wikisql(noisy_questions: str, db_dir: str, dataset: str) -> bool:
+    if dataset == "wikisql":
+        return True
+    if dataset == "spider":
+        return False
+    return "wikisql" in noisy_questions.lower() or "wikisql" in db_dir.lower()
+
+
 def run_comparison(
     noisy_questions: str,
     db_dir: str,
@@ -52,13 +64,31 @@ def run_comparison(
     reasoning_config: str = "./configs/reasoning_config.yaml",
     limit: Optional[int] = None,
     python_exe: str = sys.executable,
+    dataset: str = "auto",
+    table_file: Optional[str] = None,
 ) -> Dict:
     root = Path(project_root)
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    is_wikisql = _detect_wikisql(noisy_questions, db_dir, dataset)
+
     generate_script = str(root / "scripts" / "generate_predictions.py")
-    evaluate_script = str(root / "scripts" / "evaluate_spider.py")
+    evaluate_script = str(
+        root / "scripts" / ("evaluate_wikisql.py" if is_wikisql else "evaluate_spider.py")
+    )
+
+    if is_wikisql:
+        resolved_table_file = table_file or str(Path(db_dir) / "tables.json")
+        if not Path(resolved_table_file).exists():
+            raise RuntimeError(
+                f"WikiSQL detected but tables.json not found at {resolved_table_file}. "
+                "Run Phase 1/2 first (they auto-build it), or pass --table explicitly."
+            )
+        print(f"Dataset detected: WikiSQL (table_file={resolved_table_file})")
+    else:
+        resolved_table_file = None
+        print("Dataset detected: Spider")
 
     all_results = {}
 
@@ -70,6 +100,12 @@ def run_comparison(
         print("\n" + "=" * 70)
         print(f"CONFIG: {name}  (flags: {cfg['flags'] or '[none]'})")
         print("=" * 70)
+
+        if eval_path.exists():
+            print(f"✓ Already evaluated → {eval_path} (skipping generation + eval)")
+            with open(eval_path, "r", encoding="utf-8") as f:
+                all_results[name] = json.load(f)
+            continue
 
         gen_cmd = [
             python_exe, generate_script,
@@ -84,6 +120,11 @@ def run_comparison(
             gen_cmd += ["--reasoning_config", reasoning_config]
         if limit:
             gen_cmd += ["--limit", str(limit)]
+        if pred_path.exists():
+            # Safe whether the file is partial or already complete — generate_predictions.py
+            # counts already-written lines and only generates what's missing.
+            print(f"↻ Found partial predictions at {pred_path} — resuming generation")
+            gen_cmd += ["--resume"]
         _run(gen_cmd)
 
         eval_cmd = [
@@ -94,6 +135,8 @@ def run_comparison(
             "--etype", "all",
             "--output", str(eval_path),
         ]
+        if is_wikisql:
+            eval_cmd += ["--table", resolved_table_file]
         if limit:
             eval_cmd += ["--limit", str(limit)]
         _run(eval_cmd)
@@ -136,6 +179,12 @@ def _build_report(all_results: Dict[str, Dict]) -> Dict:
             (baseline_exec_err - error_rate) / baseline_exec_err
             if baseline_exec_err > 0 else 0.0
         )
+        # total_evaluated may live at top level (older/simpler eval scripts)
+        # or nested under scores["all"]["count"] (evaluate_spider.py /
+        # evaluate_wikisql.py's actual output shape) — check both.
+        total = res.get("total_evaluated")
+        if total is None:
+            total = res.get("scores", {}).get("all", {}).get("count", 0)
         rows.append({
             "config": name,
             "flags": cfg["flags"],
@@ -143,11 +192,10 @@ def _build_report(all_results: Dict[str, Dict]) -> Dict:
             "execution_accuracy": exec_acc,
             "error_rate": error_rate,
             "error_rate_reduction_vs_baseline": reduction if name != "baseline" else 0.0,
-            "total_evaluated": res.get("total_evaluated", 0),
+            "total_evaluated": total,
         })
 
     return {"baseline_error_rate": baseline_exec_err, "configs": rows}
-
 
 def _render_markdown(report: Dict) -> str:
     lines = [
@@ -179,6 +227,8 @@ def main():
     parser.add_argument("--chromadb_persist_dir", default="./data/embeddings/chroma_db")
     parser.add_argument("--reasoning_config", default="./configs/reasoning_config.yaml")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--dataset", choices=["auto", "spider", "wikisql"], default="auto")
+    parser.add_argument("--table", default=None)
     args = parser.parse_args()
 
     run_comparison(
@@ -190,6 +240,8 @@ def main():
         chromadb_persist_dir=args.chromadb_persist_dir,
         reasoning_config=args.reasoning_config,
         limit=args.limit,
+        dataset=args.dataset,
+        table_file=args.table,
     )
 
 

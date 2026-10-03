@@ -1,22 +1,22 @@
 ================================================================================
 SPIDER EVALUATION SUMMARY REPORT
-Generated : 2026-08-19 10:32:49
+Generated : 2026-09-15 15:18:05
 Results   : output/robustness_smoke/comparison/eval_semantic_rag.json
 ================================================================================
 
 MAIN METRICS
 ----------------------------------------
-  Exact Match Accuracy : 70.00%  (70.0%)
-  Execution Accuracy   : 75.00%  (75.0%)
+  Exact Match Accuracy : 66.92%  (66.9%)
+  Execution Accuracy   : 87.43%  (87.4%)
   Total Evaluated      : 0
 
 PER-DIFFICULTY BREAKDOWN
 ----------------------------------------
-  easy     | count=2     | EM=100.00% | EX=100.00%
-  medium   | count=14    | EM=57.14% | EX=64.29%
-  hard     | count=0     | EM=0.00% | EX=0.00%
-  extra    | count=4     | EM=100.00% | EX=100.00%
-  all      | count=20    | EM=70.00% | EX=75.00%
+  easy     | count=116   | EM=82.76% | EX=91.38%
+  medium   | count=358   | EM=84.92% | EX=93.02%
+  hard     | count=293   | EM=58.36% | EX=84.30%
+  extra    | count=267   | EM=45.32% | EX=81.65%
+  all      | count=1034  | EM=66.92% | EX=87.43%
 
 ================================================================================
 END OF REPORT

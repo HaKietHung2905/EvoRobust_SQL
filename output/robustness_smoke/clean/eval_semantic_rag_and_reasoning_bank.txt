@@ -1,7 +1,7 @@
 ================================================================================
 SPIDER EVALUATION SUMMARY REPORT
-Generated : 2026-09-17 03:43:59
-Results   : output/robustness_smoke/comparison/eval_semantic_rag_and_reasoning_bank.json
+Generated : 2026-10-01 15:44:59
+Results   : output/robustness_smoke/clean/eval_semantic_rag_and_reasoning_bank.json
 ================================================================================
 
 MAIN METRICS

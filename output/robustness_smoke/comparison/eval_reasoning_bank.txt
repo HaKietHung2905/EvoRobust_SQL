@@ -1,22 +1,22 @@
 ================================================================================
 SPIDER EVALUATION SUMMARY REPORT
-Generated : 2026-08-19 10:39:42
+Generated : 2026-09-16 15:49:19
 Results   : output/robustness_smoke/comparison/eval_reasoning_bank.json
 ================================================================================
 
 MAIN METRICS
 ----------------------------------------
-  Exact Match Accuracy : 75.00%  (75.0%)
-  Execution Accuracy   : 80.00%  (80.0%)
+  Exact Match Accuracy : 66.83%  (66.8%)
+  Execution Accuracy   : 87.23%  (87.2%)
   Total Evaluated      : 0
 
 PER-DIFFICULTY BREAKDOWN
 ----------------------------------------
-  easy     | count=2     | EM=100.00% | EX=100.00%
-  medium   | count=14    | EM=64.29% | EX=71.43%
-  hard     | count=0     | EM=0.00% | EX=0.00%
-  extra    | count=4     | EM=100.00% | EX=100.00%
-  all      | count=20    | EM=75.00% | EX=80.00%
+  easy     | count=116   | EM=83.62% | EX=91.38%
+  medium   | count=358   | EM=84.36% | EX=93.58%
+  hard     | count=293   | EM=57.68% | EX=83.28%
+  extra    | count=266   | EM=46.24% | EX=81.58%
+  all      | count=1034  | EM=66.83% | EX=87.23%
 
 ================================================================================
 END OF REPORT
