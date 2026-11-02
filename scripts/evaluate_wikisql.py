@@ -755,10 +755,16 @@ def compute_wikisql_structural_em(
     table_file: Optional[str],
     limit: Optional[int] = None,
     save_failures_csv: Optional[str] = None,
+    strict: bool = False,
 ) -> Dict[str, Any]:
     """
     Compute official WikiSQL structural EM (Zhong et al. 2017).
     Accepts original dev.json (sql as dict) OR converted wiki-format (sql as string).
+
+    strict=False (submitted paper): a predicted COUNT(*) matches a gold
+        COUNT(col) for any col (the SEL column is ignored when both use COUNT).
+    strict=True: no relaxation — SEL must match exactly, as in the official
+        WikiSQL logical-form accuracy. Report both (reviewer 3, comment 11).
 
     Returns dict with structural_em, parse_rate, agg/sel/cond accuracy,
     failure breakdown, and per_query list.
@@ -844,7 +850,8 @@ def compute_wikisql_structural_em(
             #         agg_ok = True
 
             # COUNT(*) — sel column irrelevant when both sides use COUNT
-            if (pred_struct.get("count_star")
+            if (not strict
+                    and pred_struct.get("count_star")
                     and pred_struct["agg"] == gold_struct["agg"]
                     == _SEM_AGG_OPS.index("COUNT")):
                 sel_ok = True
@@ -1277,6 +1284,13 @@ def main():
     parser.add_argument("--db",            default="./data/raw/wikisql/database")
     parser.add_argument("--save_em_failures", default=None, metavar="FILE",
                         help="Save per-query failure rows to FILE.csv for analysis")
+    parser.add_argument("--strict", action="store_true",
+                        help="Score predictions exactly as generated: no prediction "
+                             "pre-processing before EX/EM and no COUNT(*)~COUNT(col) "
+                             "relaxation in structural EM. Use the same flag for every "
+                             "system (incl. baselines) that is compared.")
+    parser.add_argument("--per_item_out", default=None, metavar="FILE.jsonl",
+                        help="Write per-question {idx, em_lenient, em_strict, ex} records")
 
     args = parser.parse_args()
 
@@ -1358,8 +1372,10 @@ def main():
     try:
         # Pre-process predictions to fix common SQL patterns that cause EX failures
         _predict_path = args.predict
-        if args.predict:
+        if args.predict and not args.strict:
             _predict_path = _preprocess_predictions_tsv(args.predict, gold_path=gold_original)
+        if args.strict:
+            logger.info("STRICT mode: predictions are scored exactly as generated.")
 
         results = evaluate(
             gold=converted_gold, predict=_predict_path, db_dir=db_dir,
@@ -1384,9 +1400,31 @@ def main():
                     table_file        = args.table,
                     limit             = args.limit,
                     save_failures_csv = args.save_em_failures,
+                    strict            = args.strict,
                 )
+                # Always also compute the other variant so both can be reported.
+                sem_other = compute_wikisql_structural_em(
+                    gold_file=gold_original, predict_tsv=_predict_path,
+                    table_file=args.table, limit=args.limit, strict=not args.strict,
+                )
+                sem_strict, sem_lenient = (sem, sem_other) if args.strict else (sem_other, sem)
+                results["strict_mode"] = bool(args.strict)
+                results["structural_em_strict"] = sem_strict["structural_em"]
+                results["structural_em_lenient"] = sem_lenient["structural_em"]
                 results["string_em_accuracy"]    = results.get("exact_match_accuracy", 0)
                 results["exact_match_accuracy"]  = sem["structural_em"]
+                if args.per_item_out:
+                    detailed = results.get("detailed_results") or []
+                    with open(args.per_item_out, "w", encoding="utf-8") as _f:
+                        for k, (qs, ql) in enumerate(zip(sem_strict["per_query"], sem_lenient["per_query"])):
+                            ex = None
+                            if k < len(detailed) and detailed[k].get("execution_match") is not None:
+                                ex = int(bool(detailed[k]["execution_match"]))
+                            _f.write(json.dumps({"idx": k, "db_id": qs["db_id"],
+                                                 "em_strict": int(bool(qs["em"])),
+                                                 "em_lenient": int(bool(ql["em"])),
+                                                 "ex": ex}) + "\n")
+                    logger.info(f"Per-item results → {args.per_item_out}")
                 results["structural_em_details"] = {
                     "parse_rate"    : sem["parse_rate"],
                     "agg_accuracy"  : sem["agg_accuracy"],

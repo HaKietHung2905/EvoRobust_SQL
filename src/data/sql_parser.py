@@ -548,7 +548,13 @@ class SQLParser:
         order_type = 'asc'
         
         if idx >= len_ or toks[idx] != 'order':
-            return idx, (order_type, val_units)
+            # Match the official Spider parser (process_sql.parse_order_by):
+            # no ORDER BY -> empty list. Returning ('asc', []) here made
+            # len(sql['orderBy']) > 0 always true, which added +1 to
+            # component1 for EVERY query in hardness.eval_hardness and
+            # shifted the difficulty distribution (116/358/293/267 instead
+            # of the official 248/446/174/166 on Spider dev).
+            return idx, val_units
         
         idx += 1
         assert toks[idx] == 'by'

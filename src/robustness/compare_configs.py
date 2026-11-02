@@ -117,7 +117,12 @@ def run_comparison(
         if "--use_chromadb" in cfg["flags"]:
             gen_cmd += ["--top_k", str(top_k), "--chromadb_persist_dir", chromadb_persist_dir]
         if "--use_reasoning_bank" in cfg["flags"]:
-            gen_cmd += ["--reasoning_config", reasoning_config]
+            # Each ReasoningBank config gets its OWN memory that starts empty;
+            # previously both RB configs shared ./memory, so the second one
+            # started from the strategies the first one had distilled.
+            gen_cmd += ["--reasoning_config", reasoning_config,
+                        "--rb_memory_dir", str(out_dir / f"memory_{name}"),
+                        "--fresh_memory"]
         if limit:
             gen_cmd += ["--limit", str(limit)]
         if pred_path.exists():

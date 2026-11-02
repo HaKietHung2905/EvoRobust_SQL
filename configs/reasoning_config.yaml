@@ -347,3 +347,9 @@ experimental:
   self_consistency_n_candidates: 4          # extra candidates besides primary
   self_consistency_agreement_threshold: 0.6 # min agreement to call primary "correct"
   self_consistency_max_confidence: 0.85     # hard cap, pseudo-label != gold
+  # CONSENSUS = primary in largest cluster with >= ceil(0.6*5) = 3 of 5 agreeing.
+  # "downgrade": consensus on an empty/all-NULL result is NOT treated as success.
+  self_consistency_empty_consensus: allow   # allow | downgrade
+  # same_as_primary: candidates reuse primary prompt (question + strategy_hints).
+  # legacy: strategies appended to question text (submitted-paper runs).
+  self_consistency_prompt: same_as_primary  # same_as_primary | legacy

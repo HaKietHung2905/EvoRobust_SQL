@@ -894,12 +894,21 @@ def evaluate_turn(
     db_path = os.path.join(db_dir, db_name, f"{db_name}.sqlite")
     schema  = load_schema(db_path)
 
-    # Placeholder queries get 0 without hitting the parser
+    # Placeholder queries get 0 without hitting the parser. Their hardness
+    # still comes from the GOLD query, so they land in a difficulty bucket;
+    # previously they were tagged 'unknown' and counted only in 'all', which
+    # made the per-level counts sum to less than the total.
     if p_str.strip().upper() == "SELECT 1":
+        try:
+            _g = normalize_sql_for_evaluation(g_str) or ""
+            _g = _normalize_not_operators(_g, is_gold=True)
+            placeholder_hardness = eval_hardness(get_sql(_g, schema))
+        except Exception:
+            placeholder_hardness = 'unknown'
         return {
             'exact_score': 0,
             'exec_score':  0,
-            'hardness':    'unknown',
+            'hardness':    placeholder_hardness,
             'entry':       {'goldSQL': g_str, 'predictSQL': p_str},
             'error':       'placeholder_query',
             'partial_scores': {}

@@ -92,6 +92,16 @@ class ReasoningBankPipeline:
         self.config = self._default_config()
         if config:
             self.config.update(config)
+            # The YAML keeps pipeline switches under `pipeline:`; before this
+            # they were never read (defaults in _default_config were used).
+            # Values in the shipped configs equal the defaults, so this is
+            # behaviour-neutral for existing runs but makes the YAML (and the
+            # run manifest) authoritative.
+            pipeline_section = config.get('pipeline', {}) or {}
+            self.config.update({
+                k: v for k, v in pipeline_section.items()
+                if k not in ('db_path', 'chromadb_path', 'enabled')
+            })
             experimental = config.get('experimental', {}) or {}
             self.config.update({
                 k: v for k, v in experimental.items()
@@ -100,6 +110,8 @@ class ReasoningBankPipeline:
                     'self_consistency_n_candidates',
                     'self_consistency_agreement_threshold',
                     'self_consistency_max_confidence',
+                    'self_consistency_empty_consensus',
+                    'self_consistency_prompt',
                 )
             })
 
@@ -123,7 +135,15 @@ class ReasoningBankPipeline:
         self.self_consistency = ExecutionSelfConsistency(
             agreement_threshold=self.config.get('self_consistency_agreement_threshold', 0.6),
             max_confidence=self.config.get('self_consistency_max_confidence', 0.85),
+            empty_consensus=self.config.get('self_consistency_empty_consensus', 'allow'),
         )
+
+        # One entry per consolidate_memory() call: when it ran, how many
+        # strategies were distilled, and the lifecycle decisions taken
+        # (kept / refined / split / deprecated / deleted / merged). Used to
+        # report how the memory evolves over the run.
+        self.consolidation_log: List[Dict] = []
+        self._gold_warning_shown = False
 
         self.stats = {
             'trajectories_collected': 0,
@@ -200,7 +220,18 @@ class ReasoningBankPipeline:
         Enhance SQL generation with ReasoningBank.
 
         5xx HTTP errors propagate up unconditionally.
+
+        Gold SQL is DROPPED here unless config['allow_gold_sql'] is True, so
+        the memory can never see gold during inference (the paper's protocol:
+        gold is used only for final evaluation). Labels come exclusively from
+        execution-based self-consistency.
         """
+        if gold_sql is not None and not self.config.get('allow_gold_sql', False):
+            if not self._gold_warning_shown:
+                logger.warning("gold_sql was passed to ReasoningBank and has been dropped "
+                               "(set allow_gold_sql: true only for oracle experiments).")
+                self._gold_warning_shown = True
+            gold_sql = None
         trajectory_id = str(uuid.uuid4())
         start_time = time.time()
 
@@ -280,12 +311,26 @@ class ReasoningBankPipeline:
                 and sql_generator is not None
             ):
                 try:
+                    # Candidates must be resampled from the SAME prompt as the
+                    # primary SQL (question + strategy_hints), only the
+                    # temperature differs. The submitted-paper runs appended
+                    # the strategies to the question text instead; set
+                    # self_consistency_prompt: legacy to reproduce them.
+                    sc_prompt_mode = self.config.get('self_consistency_prompt', 'same_as_primary')
+                    sc_hints = (self._format_strategies_as_hints(strategies_used)
+                                if strategies_used else None)
                     prompt_for_candidates = (
                         self._apply_strategies_to_prompt(question, strategies_used)
                         if strategies_used else question
                     )
 
                     def _candidate_gen(temperature: float) -> str:
+                        if sc_prompt_mode == 'same_as_primary':
+                            try:
+                                return sql_generator(question, strategy_hints=sc_hints,
+                                                     temperature=temperature)
+                            except TypeError:
+                                pass
                         try:
                             return sql_generator(prompt_for_candidates, temperature=temperature)
                         except TypeError:
@@ -309,11 +354,11 @@ class ReasoningBankPipeline:
                         exact_match=sc_result.pseudo_exact_match,
                         execution_match=sc_result.pseudo_execution_match,
                     )
-                    generation_metadata['self_consistency'] = {
-                        'agreement_ratio': sc_result.agreement_ratio,
-                        'n_candidates': sc_result.n_candidates,
-                        'pseudo_exact_match': sc_result.pseudo_exact_match,
-                    }
+                    # Full, JSON-safe record (outcome category, cluster sizes,
+                    # majority-vote SQL, candidates) for post-hoc analysis of
+                    # pseudo-label reliability and the majority-vote baseline.
+                    generation_metadata['self_consistency'] = sc_result.to_log_dict(
+                        include_candidates=True)
                 except Exception as e:
                     logger.debug(f"Self-consistency judging failed (non-critical): {e}")
 
@@ -466,6 +511,11 @@ class ReasoningBankPipeline:
                         self.stats['memory_consolidations'] += 1
 
                         if consolidation_result and isinstance(consolidation_result, dict):
+                            result['lifecycle'] = {
+                                k: consolidation_result.get(k, 0)
+                                for k in ('kept', 'refined', 'split', 'deprecated',
+                                          'deleted', 'merged', 'new_created')
+                            }
                             result['updated_strategies'] = consolidation_result.get('refined', 0)
                             result['patterns_identified'] = consolidation_result.get(
                                 'patterns_discovered', 0)
@@ -479,6 +529,16 @@ class ReasoningBankPipeline:
             logger.error(f"Critical error in consolidate_memory: {e}")
             result['errors'].append(f"Critical: {str(e)}")
 
+        try:
+            n_strategies = len(self.memory_store.get_all_strategies())
+        except Exception:
+            n_strategies = None
+        self.consolidation_log.append({
+            'trajectories_collected': self.stats['trajectories_collected'],
+            'n_strategies_after': n_strategies,
+            **{k: v for k, v in result.items() if k != 'errors'},
+            'n_errors': len(result['errors']),
+        })
         return result
 
     def _retrieve_strategies(

@@ -19,6 +19,64 @@ from utils.logging_utils import get_logger
 logger = get_logger(__name__)
 load_dotenv()
 
+
+class LLMUsageTracker:
+    """
+    Process-wide counter of LLM usage, so runs can report cost/latency per
+    query (reviewers: "five LLM calls per question plus distillation calls;
+    please report tokens or latency relative to the baselines").
+
+    calls            : logical generate() calls (one per candidate / attempt)
+    http_requests    : HTTP requests incl. retries after 429 / timeouts
+    prompt_tokens    : as reported by the API (0 if the backend omits usage)
+    completion_tokens: idem
+    latency_s        : wall-clock time inside generate(), incl. retry waits
+    """
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.calls = 0
+        self.http_requests = 0
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.latency_s = 0.0
+        self.errors = 0
+
+    def snapshot(self) -> dict:
+        return {
+            "calls": self.calls,
+            "http_requests": self.http_requests,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "latency_s": round(self.latency_s, 4),
+            "errors": self.errors,
+        }
+
+    @staticmethod
+    def delta(after: dict, before: dict) -> dict:
+        return {k: (round(after[k] - before[k], 4) if isinstance(after[k], float)
+                    else after[k] - before[k]) for k in after}
+
+    def add_tokens(self, prompt_tokens, completion_tokens):
+        try:
+            self.prompt_tokens += int(prompt_tokens or 0)
+            self.completion_tokens += int(completion_tokens or 0)
+        except (TypeError, ValueError):
+            pass
+
+
+LLM_USAGE = LLMUsageTracker()
+
+
+def _record_gemini_usage(response):
+    meta = getattr(response, "usage_metadata", None)
+    if meta is not None:
+        LLM_USAGE.add_tokens(getattr(meta, "prompt_token_count", 0),
+                             getattr(meta, "candidates_token_count", 0))
+
+
 class GoogleGenAI:
     """Wrapper for Google's Generative AI models (Gemini + MaaS)"""
 
@@ -176,6 +234,7 @@ class GoogleGenAI:
                     "Authorization": f"Bearer {self._token}",
                     "Content-Type":  "application/json",
                 }
+                LLM_USAGE.http_requests += 1
                 resp = self._requests.post(
                     self._maas_url, headers=headers, json=payload, timeout=120
                 )
@@ -200,7 +259,10 @@ class GoogleGenAI:
  
                 resp.raise_for_status()
  
-                content = resp.json()["choices"][0]["message"]["content"] or ""
+                body = resp.json()
+                usage = body.get("usage") or {}
+                LLM_USAGE.add_tokens(usage.get("prompt_tokens"), usage.get("completion_tokens"))
+                content = body["choices"][0]["message"]["content"] or ""
                 content = re.sub(r"<think>.*?</think>", "", content,
                                  flags=re.DOTALL).strip()
  
@@ -269,13 +331,18 @@ class GoogleGenAI:
             {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
         ]
         try:
+            LLM_USAGE.http_requests += 1
             r = self.model.generate_content(prompt, generation_config=gen_cfg, safety_settings=safety)
+            _record_gemini_usage(r)
             return r.text
         except Exception as e:
             if "429" in str(e):
                 logger.warning("Rate limit hit, waiting 60s...")
                 time.sleep(60)
-                return self.model.generate_content(prompt, generation_config=gen_cfg).text
+                LLM_USAGE.http_requests += 1
+                r = self.model.generate_content(prompt, generation_config=gen_cfg)
+                _record_gemini_usage(r)
+                return r.text
             raise
 
     # ------------------------------------------------------------------ #
@@ -314,7 +381,9 @@ class GoogleGenAI:
             SafetySetting(category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=HarmBlockThreshold.BLOCK_NONE),
         ]
         try:
+            LLM_USAGE.http_requests += 1
             r = self.model.generate_content(prompt, generation_config=gen_cfg, safety_settings=safety)
+            _record_gemini_usage(r)
             return r.text
         except google_exceptions.ResourceExhausted as e:
             logger.warning(f"Vertex AI 429 - will retry: {e}")
@@ -342,13 +411,20 @@ class GoogleGenAI:
                  Pass a longer string on retry to force specific SQL structure,
                  e.g. "SELECT name FROM " to prevent truncation before FROM.
         """
-        if self._is_maas_model(self.model_name):
-            return self._generate_maas(prompt, temperature, max_output_tokens,
-                                       prefill=prefill)
-        elif self.use_vertex_ai:
-            return self._generate_vertex_ai(prompt, temperature,
-                                            max_output_tokens, stop_sequences)
-        else:
-            return self._generate_ai_studio(prompt, temperature,
-                                            max_output_tokens, stop_sequences)
- 
+        LLM_USAGE.calls += 1
+        start = time.time()
+        try:
+            if self._is_maas_model(self.model_name):
+                return self._generate_maas(prompt, temperature, max_output_tokens,
+                                           prefill=prefill)
+            elif self.use_vertex_ai:
+                return self._generate_vertex_ai(prompt, temperature,
+                                                max_output_tokens, stop_sequences)
+            else:
+                return self._generate_ai_studio(prompt, temperature,
+                                                max_output_tokens, stop_sequences)
+        except Exception:
+            LLM_USAGE.errors += 1
+            raise
+        finally:
+            LLM_USAGE.latency_s += time.time() - start
